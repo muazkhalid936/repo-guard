@@ -3,8 +3,8 @@
 Reads files and git objects as data. It never runs, imports or checks out anything it scans.
 Run with `python3 -I` so nothing is loaded from the scanned folder.
 
-  engine.py full  --watch DIR --state FILE --rules FILE --log FILE
-  engine.py event --watch DIR --state FILE --rules FILE --log FILE --paths-file FILE
+  engine.py full  --watch DIR [--watch DIR ...] --state FILE --rules FILE --log FILE
+  engine.py event --watch DIR [--watch DIR ...] --state FILE --rules FILE --log FILE --paths-file FILE
   engine.py ignore-active --state FILE
 """
 import argparse, datetime, hashlib, json, os, re, stat, subprocess, sys
@@ -14,6 +14,10 @@ GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 GIT_ENV.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C")
 # Plumbing commands only, with program-running settings neutralised.
 GIT_BASE = [GIT, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.sshCommand=/usr/bin/false", "-c", "core.pager=cat"]
+
+
+def under(path, folder):
+    return path == folder or path.startswith(folder + os.sep)
 
 
 class Rules:
@@ -93,7 +97,13 @@ def read_blobs(repo, shas, limit):
 class Scanner:
     def __init__(self, a):
         self.rules = Rules(a.rules)
-        self.watch = os.path.realpath(a.watch)
+        real = sorted({os.path.realpath(w) for w in a.watch}, key=len)
+        self.watches = []
+        for w in real:  # a folder inside another watched folder is already covered
+            if not any(under(w, kept) for kept in self.watches):
+                self.watches.append(w)
+        self.errors = []
+        self.failed = []
         self.state_path = a.state
         self.log_path = a.log
         try:
@@ -116,7 +126,12 @@ class Scanner:
 
     def add(self, root, path, rule, severity, label, where, sig):
         if severity != "block":
-            self.reviews.append({"root": root, "path": path, "label": label, "where": where})
+            item = {"root": root, "path": path, "label": label, "where": where,
+                    "time": datetime.datetime.now().isoformat(timespec="seconds")}
+            self.reviews.append(item)
+            kept = [r for r in self.state.setdefault("reviews", [])
+                    if (r["root"], r["path"], r["label"]) != (root, path, label)]
+            self.state["reviews"] = (kept + [item])[-100:]
             self.log(f"REVIEW {root} {path}: {label} [{where}]")
             return
         key = f"{root}|{path}|{rule}|{sig}"
@@ -164,14 +179,19 @@ class Scanner:
 
     def root_of(self, path):
         """Nearest ancestor holding .git, otherwise the top-level folder inside the watch dir."""
+        watch = self.watch_for(path) or os.path.dirname(path)
         cur = os.path.dirname(path)
         top = None
-        while cur.startswith(self.watch) and cur != self.watch:
+        while under(cur, watch) and cur != watch:
             if os.path.lexists(os.path.join(cur, ".git")):
                 return cur
             top = cur
             cur = os.path.dirname(cur)
-        return top or self.watch
+        # A watched folder can itself be a repo.
+        return top or watch
+
+    def watch_for(self, path):
+        return next((w for w in self.watches if under(path, w)), None)
 
     # ---- git refs
     def scan_config(self, repo):
@@ -278,46 +298,78 @@ class Scanner:
                 self.add(repo, f[0], "tz_mismatch", "review", "Commit timezone mismatch, as seen in rewritten malware commits", f"incoming:{ref}", f[0])
 
     # ---- entry points
-    def require_access(self):
-        """An unreadable folder must fail loudly, not look like a clean scan."""
-        try:
-            os.listdir(self.watch)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            sys.exit(f"No permission to read {self.watch}: {e}")
+    def check_access(self):
+        """A missing or unreadable folder is reported, never treated as a clean scan."""
+        self.failed, self.errors = [], []
+        for w in self.watches:
+            try:
+                os.listdir(w)
+            except FileNotFoundError:
+                self.failed.append(w)
+                self.errors.append(f"This folder is missing: {w}")
+            except OSError:
+                self.failed.append(w)
+                self.errors.append(f"RepoGuard can't read this folder: {w}. Allow access in System Settings.")
+        for e in self.errors:
+            self.log(f"FOLDER ERROR {e}")
+
+    def in_failed(self, path):
+        return any(under(path, w) for w in self.failed)
 
     def full(self):
-        self.require_access()
+        self.check_access()
         repos = []
-        if os.path.isdir(self.watch):
-            self.walk(self.watch, self.watch, repos)
+        for w in self.watches:
+            if w not in self.failed:
+                self.walk(w, w, repos)
         for repo in repos:
             self.scan_config(repo)
             self.scan_refs(repo, force=True)
         known = set(repos)
-        for gone in [r for r in self.state["refs"] if r not in known]:
+        # Results from a folder we can't read right now are kept, because nothing proved them fixed.
+        for gone in [r for r in self.state["refs"] if r not in known and not self.in_failed(r)]:
             del self.state["refs"][gone]
-        # Clear findings from folders that no longer exist.
+        # Clear findings from folders that no longer exist or are no longer watched.
         for k, f in list(self.state["findings"].items()):
-            if not os.path.exists(f["root"]):
+            if self.in_failed(f["root"]):
+                continue
+            if not os.path.exists(f["root"]) or not self.watch_for(f["root"] + os.sep + "x"):
                 del self.state["findings"][k]
+        self.state["reviews"] = [r for r in self.state.get("reviews", [])
+                                 if self.in_failed(r["root"]) or (os.path.exists(r["root"]) and self.watch_for(r["root"] + os.sep + "x"))]
+        self.state["last_full"] = {"files": self.files, "time": datetime.datetime.now().isoformat(timespec="seconds")}
+
+    def repo_info(self):
+        """Summary for the app's Repositories screen. Reads .git/HEAD as text only."""
+        info = []
+        for repo, refs in sorted(self.state["refs"].items()):
+            branch = ""
+            try:
+                head = open(os.path.join(repo, ".git", "HEAD")).read().strip()
+                branch = head[16:] if head.startswith("ref: refs/heads/") else "detached"
+            except OSError:
+                pass
+            count = sum(1 for r in refs if r.startswith("refs/heads/") or r.startswith("refs/remotes/"))
+            threats = sum(1 for f in self.state["findings"].values() if f["root"] == repo)
+            info.append({"path": repo, "branch": branch, "branches": count, "threats": threats})
+        return info
 
     def event(self, paths):
-        self.require_access()
+        self.check_access()
         ref_dirty, config_dirty = set(), set()
         files, folders = set(), set()
         for p in paths:
             p = p.rstrip("/")
-            if not p.startswith(self.watch):
+            watch = self.watch_for(p)
+            if not watch or watch in self.failed:
                 continue
-            rel = os.path.relpath(p, self.watch)
+            rel = os.path.relpath(p, watch)
             parts = rel.split(os.sep)
             if any(x in self.rules.skip_dirs for x in parts):
                 continue
             if ".git" in parts:
                 i = parts.index(".git")
-                repo = os.path.join(self.watch, *parts[:i])
+                repo = os.path.join(watch, *parts[:i])
                 inner = parts[i + 1:]
                 if not inner or inner[0] in ("HEAD", "ORIG_HEAD", "FETCH_HEAD", "packed-refs", "refs"):
                     ref_dirty.add(repo)
@@ -353,13 +405,15 @@ class Scanner:
             json.dump(self.state, fh)
         os.replace(tmp, self.state_path)
         self.log(f"scan done: files={self.files} repos={len(self.repos)} new={len(new)} active={len(active)}")
-        print(json.dumps({"new": new, "active": active, "reviews": self.reviews, "files": self.files, "repos": len(self.repos)}))
+        print(json.dumps({"new": new, "active": active, "reviews": self.reviews, "files": self.files, "repos": len(self.repos),
+                          "repo_info": self.repo_info(), "recent_reviews": self.state.get("reviews", []),
+                          "last_full": self.state.get("last_full"), "errors": self.errors}))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["full", "event", "ignore-active"])
-    ap.add_argument("--watch", default="")
+    ap.add_argument("--watch", action="append", default=[])
     ap.add_argument("--state", required=True)
     ap.add_argument("--rules", default="")
     ap.add_argument("--log", default="")

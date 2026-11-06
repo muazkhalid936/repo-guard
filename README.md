@@ -1,6 +1,6 @@
 # RepoGuard
 
-Menu bar app that watches `~/Documents/github` and warns when suspicious code arrives from any source: GitHub Desktop, VS Code, the terminal, or an unzipped folder. It reads files and git objects as data and never runs what it scans.
+Mac app with a Dashboard, Threats, Repositories, Activity and Settings window, plus a menu bar icon that keeps running after the window closes. On first launch it asks which folders hold your repos, then watches them and warns when suspicious code arrives from any source: GitHub Desktop, VS Code, the terminal, or an unzipped folder. It reads files and git objects as data and never runs what it scans.
 
 ## Build and install
 
@@ -9,7 +9,7 @@ Menu bar app that watches `~/Documents/github` and warns when suspicious code ar
 open ~/Applications/RepoGuard.app
 ```
 
-Requires Xcode Command Line Tools. Don't move this project into the watched folder, because `rules.json` contains malware signatures and would trigger alerts.
+Requires Xcode Command Line Tools, not full Xcode. Don't put this project inside a watched folder, because `rules.json` contains malware signatures and would trigger alerts.
 
 ## What it scans
 
@@ -31,10 +31,18 @@ Edit `Resources/rules.json`, run `./build.sh install`, restart the app, then cho
 
 Tests use fake repos containing harmless copies of the malware's patterns.
 
+## Checking the design
+
+```bash
+REPOGUARD_SNAPSHOT=/path/to/output build/RepoGuard.app/Contents/MacOS/RepoGuard
+```
+
+This renders every screen to PNG using sample data, without opening a window.
+
 ## Limits
 
 It warns after files arrive, so it can't stop them landing. It matches known techniques and can miss a new attack. It doesn't inspect inside npm packages. Malware already running on the Mac could stop it.
 
 ## Uninstall
 
-Turn off **Launch at Login** in the menu, quit the app, then delete `~/Applications/RepoGuard.app`, `~/Library/Application Support/RepoGuard` and `~/Library/Logs/RepoGuard.log`.
+Turn off **Start at login** in Settings, quit the app, then delete `~/Applications/RepoGuard.app`, `~/Library/Application Support/RepoGuard` and `~/Library/Logs/RepoGuard.log`.
