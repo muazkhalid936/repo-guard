@@ -1,305 +1,230 @@
 import AppKit
-import CoreServices
-import Foundation
+import SwiftUI
 
-// RepoGuard: menu bar app that watches a folder and scans changes for repo malware.
-// All detection lives in Resources/engine.py and Resources/rules.json.
+// RepoGuard: a window for managing it, a menu bar icon that keeps protection running.
 
-struct Finding: Decodable {
-    let key: String
-    let root: String
-    let path: String
-    let label: String
-    let `where`: String
-}
-
-struct ScanResult: Decodable {
-    let new: [Finding]
-    let active: [Finding]
-    let files: Int
-    let repos: Int
-}
-
-let env = ProcessInfo.processInfo.environment
-let testMode = env["REPOGUARD_TEST"] != nil
-let home = FileManager.default.homeDirectoryForCurrentUser.path
-let watchDir = env["REPOGUARD_WATCH"] ?? "\(home)/Documents/github"
-let supportDir = env["REPOGUARD_SUPPORT"] ?? "\(home)/Library/Application Support/RepoGuard"
-let logFile = env["REPOGUARD_LOG"] ?? "\(home)/Library/Logs/RepoGuard.log"
-let agentLabel = "local.repoguard.app"
-let agentPath = "\(home)/Library/LaunchAgents/\(agentLabel).plist"
-
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let scanQueue = DispatchQueue(label: "repoguard.scan")
-    let lock = NSLock()
-    var pending = Set<String>()
-    var debounce: DispatchWorkItem?
-    var stream: FSEventStreamRef?
-    var active: [Finding] = []
-    var lastScan = "Starting…"
-    var lastError: String?
-    var scanning = false
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
+    let model = AppModel()
+    let nav = Navigation()
+    let background = CommandLine.arguments.contains("--background") || testMode
+    var statusItem: NSStatusItem?
+    var window: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if !testMode {
-            let same = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
-            if same.count > 1 { NSApp.terminate(nil); return }
-        }
-        try? FileManager.default.createDirectory(atPath: supportDir, withIntermediateDirectories: true)
-        statusItem.menu = NSMenu()
-        statusItem.menu?.delegate = self
-        updateIcon()
-        if !testMode && !UserDefaults.standard.bool(forKey: "loginConfigured") {
-            setLaunchAtLogin(true)
-            UserDefaults.standard.set(true, forKey: "loginConfigured")
-        }
-        startWatching()
-        runEngine(mode: "full", paths: nil)
-    }
-
-    // MARK: watching
-
-    func startWatching() {
-        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
-            guard let info = info else { return }
-            let me = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
-            let array = unsafeBitCast(eventPaths, to: NSArray.self)
-            var paths: [String] = []
-            for i in 0..<count { if let p = array[i] as? String { paths.append(p) } }
-            me.queue(paths)
-        }
-        let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)
-        stream = FSEventStreamCreate(kCFAllocatorDefault, callback, &context, [watchDir] as CFArray,
-                                     FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0, flags)
-        if let stream = stream {
-            FSEventStreamSetDispatchQueue(stream, DispatchQueue.global(qos: .utility))
-            FSEventStreamStart(stream)
-        }
-    }
-
-    func queue(_ paths: [String]) {
-        let skip = ["/node_modules/", "/.next/", "/.git/objects/", "/.git/logs/", "/.git/index", "/.git/lfs/"]
-        let useful = paths.filter { p in !skip.contains { p.contains($0) } }
-        if useful.isEmpty { return }
-        lock.lock()
-        pending.formUnion(useful)
-        debounce?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.flush() }
-        debounce = work
-        lock.unlock()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5, execute: work)
-    }
-
-    func flush() {
-        lock.lock()
-        let batch = Array(pending)
-        pending.removeAll()
-        lock.unlock()
-        if !batch.isEmpty { runEngine(mode: "event", paths: batch) }
-    }
-
-    // MARK: scanning
-
-    func runEngine(mode: String, paths: [String]?) {
-        scanQueue.async { [weak self] in
-            guard let self = self else { return }
-            DispatchQueue.main.async { self.scanning = true; self.updateIcon() }
-            let result = self.execute(mode: mode, paths: paths)
-            DispatchQueue.main.async {
-                self.scanning = false
-                switch result {
-                case .success(let r):
-                    self.active = r.active
-                    self.lastError = nil
-                    let f = DateFormatter(); f.timeStyle = .short
-                    self.lastScan = "Last scan \(f.string(from: Date())): \(r.files) files"
-                    if !r.new.isEmpty { self.alert(r.new) }
-                case .failure(let e):
-                    self.lastError = e.localizedDescription
-                }
-                self.updateIcon()
+        if !testMode, let id = Bundle.main.bundleIdentifier {
+            let others = NSRunningApplication.runningApplications(withBundleIdentifier: id).filter { $0 != NSRunningApplication.current }
+            if let first = others.first {
+                first.activate(options: [])
+                NSApp.terminate(nil)
+                return
             }
         }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem?.menu = menu
+        updateIcon()
+        if !testMode {
+            if !UserDefaults.standard.bool(forKey: "loginConfigured") {
+                model.setLaunchAtLogin(true)
+                UserDefaults.standard.set(true, forKey: "loginConfigured")
+            } else if model.launchAtLogin {
+                model.setLaunchAtLogin(true) // keep the login entry pointing at this copy of the app
+            }
+        }
+        NSApp.mainMenu = buildMainMenu()
+        model.onChange = { [weak self] in self?.updateIcon() }
+        model.onNewThreats = { [weak self] found in self?.alert(found) }
+        model.start()
+        // Setup can't be skipped, even when launched quietly at login.
+        if !background || !model.setupDone { showWindow() }
     }
 
-    func execute(mode: String, paths: [String]?) -> Result<ScanResult, Error> {
-        guard let engine = Bundle.main.path(forResource: "engine", ofType: "py"),
-              let rules = Bundle.main.path(forResource: "rules", ofType: "json") else {
-            return .failure(NSError(domain: "RepoGuard", code: 1, userInfo: [NSLocalizedDescriptionKey: "Engine files are missing from the app"]))
-        }
-        var args = ["-I", engine, mode, "--watch", watchDir, "--state", "\(supportDir)/state.json", "--rules", rules, "--log", logFile]
-        if let paths = paths {
-            let file = "\(supportDir)/paths.json"
-            do {
-                try JSONSerialization.data(withJSONObject: paths).write(to: URL(fileURLWithPath: file))
-            } catch { return .failure(error) }
-            args += ["--paths-file", file]
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        p.arguments = args
-        p.currentDirectoryURL = URL(fileURLWithPath: "/")
-        let out = Pipe(), err = Pipe()
-        p.standardOutput = out
-        p.standardError = err
-        do { try p.run() } catch { return .failure(error) }
-        var errData = Data()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        group.wait()
-        if p.terminationStatus != 0 {
-            let text = String(data: errData, encoding: .utf8) ?? ""
-            appendLog("ENGINE ERROR: \(text)")
-            return .failure(NSError(domain: "RepoGuard", code: 2, userInfo: [NSLocalizedDescriptionKey: "Scan failed. See the log."]))
-        }
-        do { return .success(try JSONDecoder().decode(ScanResult.self, from: data)) } catch { return .failure(error) }
+    // Opening the app from Finder or the Dock while it's already running.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow()
+        return true
     }
 
-    func appendLog(_ text: String) {
-        guard let h = FileHandle(forWritingAtPath: logFile) else {
-            FileManager.default.createFile(atPath: logFile, contents: text.data(using: .utf8))
-            return
-        }
-        h.seekToEndOfFile()
-        h.write(text.data(using: .utf8) ?? Data())
-        h.closeFile()
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if !background && window?.isVisible != true && NSApp.activationPolicy() == .accessory { showWindow() }
     }
 
-    // MARK: UI
+    // Protection keeps running after the window closes.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
+    @objc func showWindow() {
+        NSApp.setActivationPolicy(.regular)
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.title = "RepoGuard"
+            w.titlebarAppearsTransparent = true
+            w.isReleasedWhenClosed = false
+            w.delegate = self
+            w.contentView = NSHostingView(rootView: RootView(model: model, nav: nav))
+            w.center()
+            w.setFrameAutosaveName("RepoGuardMain")
+            window = w
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func buildMainMenu() -> NSMenu {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Hide RepoGuard", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit RepoGuard", action: #selector(quit), keyEquivalent: "q").target = self
+        appItem.submenu = appMenu
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = windowMenu
+        return main
+    }
+
+    // MARK: menu bar
 
     func updateIcon() {
-        guard let button = statusItem.button else { return }
-        let threat = !active.isEmpty
-        let name = threat ? "exclamationmark.shield.fill" : (lastError != nil ? "shield.slash" : "checkmark.shield")
+        guard let button = statusItem?.button else { return }
+        let threat = !model.active.isEmpty
+        let name = threat ? "exclamationmark.shield.fill" : (model.lastError != nil ? "shield.slash" : "checkmark.shield")
         let image = NSImage(systemSymbolName: name, accessibilityDescription: "RepoGuard")
         image?.isTemplate = !threat
         button.image = image
         button.contentTintColor = threat ? .systemRed : nil
-        button.title = threat ? " \(active.count)" : ""
-        button.toolTip = threat ? "RepoGuard: \(active.count) threats" : "RepoGuard: all clear"
+        button.title = threat ? " \(model.active.count)" : ""
+        button.toolTip = threat ? "RepoGuard: \(model.active.count) threats" : (model.lastError != nil ? "RepoGuard: not protected" : "RepoGuard: all clear")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let title: String
-        if let e = lastError { title = "Not protected: \(e)" }
-        else if !active.isEmpty { title = "\(active.count) threat\(active.count == 1 ? "" : "s") found" }
-        else { title = scanning ? "Scanning…" : "All clear" }
-        menu.addItem(disabled(title))
-        menu.addItem(disabled("Watching \((watchDir as NSString).abbreviatingWithTildeInPath)"))
-        menu.addItem(disabled(lastScan))
-        if !active.isEmpty {
-            menu.addItem(.separator())
-            for f in active.prefix(10) {
-                let repo = (f.root as NSString).lastPathComponent
-                let item = NSMenuItem(title: "\(repo): \(f.path) (\(f.label))", action: #selector(reveal(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = "\(f.root)/\(f.path)"
-                menu.addItem(item)
-            }
-            if active.count > 10 { menu.addItem(disabled("…and \(active.count - 10) more, see the log")) }
-        }
+        if let e = model.lastError { title = "Not protected: \(e)" }
+        else if !model.active.isEmpty { title = "\(model.active.count) threat\(model.active.count == 1 ? "" : "s") found" }
+        else { title = model.scanning ? "Scanning…" : "All clear" }
+        let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        let seen = NSMenuItem(title: "Last scan: \(relativeTime(model.lastScan))", action: nil, keyEquivalent: "")
+        seen.isEnabled = false
+        menu.addItem(seen)
         menu.addItem(.separator())
-        menu.addItem(action("Scan Everything Now", #selector(scanNow), "s"))
-        menu.addItem(action("Open Log", #selector(openLog), "l"))
-        if !active.isEmpty { menu.addItem(action("Mark All as False Alarm…", #selector(ignoreAll), "")) }
-        let login = action("Launch at Login", #selector(toggleLogin), "")
-        login.state = FileManager.default.fileExists(atPath: agentPath) ? .on : .off
-        menu.addItem(login)
+        if !model.active.isEmpty { menu.addItem(item("Review Threats…", #selector(showThreats), "")) }
+        menu.addItem(item("Open RepoGuard", #selector(showWindow), "o"))
+        menu.addItem(item("Scan Now", #selector(scanNow), "r"))
         menu.addItem(.separator())
-        menu.addItem(action("Quit RepoGuard", #selector(quit), "q"))
+        menu.addItem(item("Quit RepoGuard", #selector(quit), "q"))
     }
 
-    func disabled(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        return item
+    func item(_ title: String, _ selector: Selector, _ key: String) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: selector, keyEquivalent: key)
+        i.target = self
+        return i
     }
 
-    func action(_ title: String, _ selector: Selector, _ key: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
-        item.target = self
-        return item
-    }
+    @objc func showThreats() { nav.screen = .threats; showWindow() }
+    @objc func scanNow() { model.scanNow() }
+    @objc func quit() { NSApp.terminate(nil) }
 
     func alert(_ found: [Finding]) {
-        if testMode { return }
+        if testMode || !model.popupsEnabled { return }
         NSSound(named: "Basso")?.play()
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.alertStyle = .critical
         a.messageText = "Malware warning: suspicious code found"
-        let lines = found.prefix(8).map { "• \(($0.root as NSString).lastPathComponent)/\($0.path)\n   \($0.label)" }.joined(separator: "\n")
-        let more = found.count > 8 ? "\n…and \(found.count - 8) more." : ""
-        a.informativeText = "\(lines)\(more)\n\nDon't open this project in VS Code or run npm commands in it. Don't click Pull or Merge if this came from a fetch. Nothing from it has been run by RepoGuard."
-        a.addButton(withTitle: "Show in Finder")
-        a.addButton(withTitle: "OK")
-        if a.runModal() == .alertFirstButtonReturn, let f = found.first {
-            revealPath("\(f.root)/\(f.path)", root: f.root)
+        let lines = found.prefix(6).map { "• \($0.repoName)/\($0.path)\n   \($0.label)" }.joined(separator: "\n")
+        let more = found.count > 6 ? "\n…and \(found.count - 6) more." : ""
+        a.informativeText = "\(lines)\(more)\n\nDon't open this project in VS Code, run npm commands, or click Pull or Merge. RepoGuard hasn't run any of this code."
+        a.addButton(withTitle: "Review Threats")
+        a.addButton(withTitle: "Dismiss")
+        if a.runModal() == .alertFirstButtonReturn { showThreats() }
+    }
+}
+
+// MARK: snapshots, used to check the design without showing a window
+
+func writeSnapshots(to dir: String) {
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    func sampleModel(threats: Bool, failed: Bool = false) -> AppModel {
+        let m = AppModel()
+        m.watchDirs = ["\(home)/Documents/github"]
+        m.setupDone = true
+        m.loaded = true
+        m.lastScan = Date()
+        m.filesChecked = 3303
+        m.lastError = failed ? "RepoGuard can't read this folder. Allow access in System Settings." : nil
+        m.repos = [RepoInfo(path: "\(home)/Documents/github/tsk-diet", branch: "main", branches: 2, threats: threats ? 2 : 0),
+                   RepoInfo(path: "\(home)/Documents/github/ask-biz", branch: "main", branches: 2, threats: 0),
+                   RepoInfo(path: "\(home)/Documents/github/pet-hut/pet-hut-frontend", branch: "main", branches: 4, threats: threats ? 1 : 0),
+                   RepoInfo(path: "\(home)/Documents/github/pet-hut/pet-hut-backend", branch: "master", branches: 10, threats: 0)]
+        m.activity = [LogEntry(id: 1, time: "2026-11-06 17:09:19", kind: .scan, text: "Scanned 3303 files in 4 repos, nothing new"),
+                      LogEntry(id: 2, time: "2026-11-06 15:40:02", kind: .review, text: "tsk-diet .vscode/tasks.json: File that can run code automatically"),
+                      LogEntry(id: 3, time: "2026-11-06 14:21:00", kind: .scan, text: "Scanned 3288 files in 4 repos, nothing new")]
+        if threats {
+            func f(_ repo: String, _ path: String, _ label: String, _ w: String) -> Finding {
+                Finding(key: repo + path + label, root: "\(home)/Documents/github/\(repo)", path: path, rule: "x", label: label, where: w, time: "2026-11-06T17:12:44")
+            }
+            m.active = [f("tsk-diet", "postcss.config.mjs", "Code hidden far off-screen", "branch:refs/remotes/origin/main"),
+                        f("tsk-diet", ".vscode/tasks.json", "Runs automatically when the folder opens", "folder"),
+                        f("pet-hut/pet-hut-frontend", "public/fonts/fa-brand-400.orc", "Fake font payload file (.orc)", "incoming:refs/remotes/origin/main")]
+            m.activity.insert(LogEntry(id: 0, time: "2026-11-06 17:12:44", kind: .threat, text: "tsk-diet postcss.config.mjs: Code hidden far off-screen"), at: 0)
+            m.reviews = [ReviewItem(root: "\(home)/Documents/github/tsk-diet", path: "origin/main", label: "Branch history was rewritten (force-push)", where: "x", time: nil)]
+        }
+        return m
+    }
+    func render(_ name: String, _ model: AppModel, _ screen: Screen, dark: Bool = false) {
+        let nav = Navigation()
+        nav.screen = screen
+        let host = NSHostingView(rootView: RootView(model: model, nav: nav))
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        w.titlebarAppearsTransparent = true
+        w.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        w.contentView = host
+        w.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
         }
     }
-
-    func revealPath(_ path: String, root: String) {
-        let target = FileManager.default.fileExists(atPath: path) ? path : root
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: target)])
-    }
-
-    @objc func reveal(_ sender: NSMenuItem) {
-        guard let p = sender.representedObject as? String else { return }
-        var root = p
-        if let f = active.first(where: { "\($0.root)/\($0.path)" == p }) { root = f.root }
-        revealPath(p, root: root)
-    }
-
-    @objc func scanNow() { runEngine(mode: "full", paths: nil) }
-
-    @objc func openLog() {
-        if !FileManager.default.fileExists(atPath: logFile) { FileManager.default.createFile(atPath: logFile, contents: nil) }
-        NSWorkspace.shared.open(URL(fileURLWithPath: logFile))
-    }
-
-    @objc func ignoreAll() {
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.alertStyle = .warning
-        a.messageText = "Mark \(active.count) findings as false alarms?"
-        a.informativeText = "Only do this if you're sure this code is safe. RepoGuard stops warning about these exact file versions, and warns again if they change."
-        a.addButton(withTitle: "Cancel")
-        a.addButton(withTitle: "Mark as False Alarm")
-        guard a.runModal() == .alertSecondButtonReturn else { return }
-        runEngine(mode: "ignore-active", paths: nil)
-    }
-
-    @objc func toggleLogin() {
-        setLaunchAtLogin(!FileManager.default.fileExists(atPath: agentPath))
-    }
-
-    func setLaunchAtLogin(_ on: Bool) {
-        if on {
-            let plist: [String: Any] = [
-                "Label": agentLabel,
-                "ProgramArguments": [Bundle.main.executablePath ?? ""],
-                "RunAtLoad": true,
-                "LimitLoadToSessionType": "Aqua",
-                "ProcessType": "Interactive",
-            ]
-            try? FileManager.default.createDirectory(atPath: (agentPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            (plist as NSDictionary).write(toFile: agentPath, atomically: true)
-        } else {
-            try? FileManager.default.removeItem(atPath: agentPath)
-        }
-    }
-
-    @objc func quit() { NSApp.terminate(nil) }
+    let empty = sampleModel(threats: false); empty.setupDone = false; empty.watchDirs = []
+    render("0-welcome-empty", empty, .dashboard)
+    let chosen = sampleModel(threats: false); chosen.setupDone = false
+    chosen.watchDirs = ["\(home)/Documents/github", "\(home)/Projects/client-work"]
+    render("0-welcome-chosen", chosen, .dashboard)
+    let many = sampleModel(threats: false); many.watchDirs = ["\(home)/Documents/github", "\(home)/Projects/client-work"]
+    render("9-settings-folders", many, .settings)
+    render("1-dashboard-clear", sampleModel(threats: false), .dashboard)
+    render("2-dashboard-threats", sampleModel(threats: true), .dashboard)
+    render("3-threats", sampleModel(threats: true), .threats)
+    render("4-repositories", sampleModel(threats: true), .repositories)
+    render("5-activity", sampleModel(threats: true), .activity)
+    render("6-settings", sampleModel(threats: false), .settings)
+    render("7-dashboard-dark", sampleModel(threats: false), .dashboard, dark: true)
+    render("8-not-protected", sampleModel(threats: false, failed: true), .dashboard)
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+if let dir = env["REPOGUARD_SNAPSHOT"] {
+    app.setActivationPolicy(.accessory)
+    writeSnapshots(to: dir)
+    exit(0)
+}
 let delegate = AppDelegate()
+app.setActivationPolicy(delegate.background ? .accessory : .regular)
 app.delegate = delegate
 app.run()

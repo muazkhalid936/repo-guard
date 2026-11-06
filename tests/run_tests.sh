@@ -52,8 +52,24 @@ ok "the scanner did not run any trap" "$([ -e "$T/TRAP_RAN" ] && echo ran || ech
 rm -rf "$W/evil"; eng full >/dev/null
 
 mkdir -p "$T/locked"; chmod 000 "$T/locked"
-/usr/bin/python3 -I "$RES/engine.py" full --watch "$T/locked" --state "$T/ls.json" --rules "$RES/rules.json" >/dev/null 2>&1; RC=$?
-chmod 755 "$T/locked"; [ "$RC" != 0 ] && ok "unreadable folder fails loudly, not clean" yes yes || ok "unreadable folder fails loudly, not clean" no yes
+LOCKED=$(/usr/bin/python3 -I "$RES/engine.py" full --watch "$T/locked" --state "$T/ls.json" --rules "$RES/rules.json" 2>/dev/null | count errors)
+chmod 755 "$T/locked"; ok "unreadable folder is reported, not called clean" "$LOCKED" 1
+
+# Several folders
+A="$T/multi/github"; B="$T/multi/github2"; mkdir -p "$A/x" "$B/y"; MS="$T/ms.json"
+mscan() { /usr/bin/python3 -I "$RES/engine.py" full --watch "$A" --watch "$B" "$@" --state "$MS" --rules "$RES/rules.json"; }
+print 'x' > "$B/y/payload.orc"
+ok "second folder is scanned too" "$(mscan | count active)" 1
+ok "similar folder names don't merge" "$(/usr/bin/python3 -I "$RES/engine.py" full --watch "$A" --state "$MS" --rules "$RES/rules.json" | count active)" 0
+print 'x' > "$A/x/one.orc"; print 'x' > "$B/y/two.orc"
+mscan >/dev/null
+mv "$B" "$B.moved"
+R=$(mscan)
+ok "missing folder is reported" "$(print -r -- "$R" | count errors)" 1
+ok "other folder still scanned, missing folder's results kept" "$(print -r -- "$R" | count active)" 3
+mv "$B.moved" "$B"
+ok "folder inside a watched folder isn't double-scanned" "$(/usr/bin/python3 -I "$RES/engine.py" full --watch "$A" --watch "$A/x" --state "$T/ns.json" --rules "$RES/rules.json" | count active)" 1
+ok "no watch list scans nothing, reports no false error" "$(/usr/bin/python3 -I "$RES/engine.py" full --state "$T/es.json" --rules "$RES/rules.json" | count errors)" 0
 
 mkdir -p "$W/app/node_modules/pkg"; bad_postcss "$W/app/node_modules/pkg/index.js"
 ok "node_modules is skipped by the folder watch" "$(ev "$W/app/node_modules/pkg/index.js" | count active)" 0
