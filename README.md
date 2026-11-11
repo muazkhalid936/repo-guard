@@ -42,6 +42,41 @@ Add Linux servers that sign in with a password, a `.pem` key file, or AWS EC2 In
 
 **Remove Threats** backs up everything it changes to `/var/backups/repoguard/<time>` on the server. Passwords are kept in the macOS Keychain.
 
+## This Mac
+
+Checks what starts automatically and what is running, about once every 15 minutes (it takes a second):
+
+- launch agents and daemons, with who signed each program; anything pretending to be Apple's, or starting from a temp, cache or hidden folder, is a threat
+- login items, your crontab, shell startup files (`.zshrc`, `.zprofile`, `/etc/zshrc` …)
+- VS Code, Cursor and Windsurf user settings that run tasks automatically
+- running programs: crypto-miners, known malware commands, scripts running from temp or cache folders, unsigned programs using a lot of CPU
+- scripts dropped in `/tmp`, `/Users/Shared` and `~/Library/Caches`
+
+**Remove Threats** turns off bad startup items, stops bad programs and cuts bad lines out of files, backing each one up to the quarantine folder first. Any startup item can be turned off from the list. Items in `/Library` ask for your administrator password in the normal macOS dialog.
+
+## Cleanup
+
+**Analyze** first maps the whole disk (about 3 minutes), then finds what can be freed:
+
+- **Where your space goes:** one bar for the whole drive: macOS, swap, apps, the biggest folders in your home, Homebrew and system files, space it can't read yet, and free space.
+- **Why the disk is full:** plain explanations of the biggest users (Docker's disk file, simulators, Android, Cursor's chat database, iCloud files, hidden tool folders), each with a button to explore, show in Finder or jump to what can be cleaned.
+- **Explore:** drill into any folder by size. Folders in Desktop, Documents, Downloads, Movies, Music and Pictures can be moved to the Trash from here.
+- **Largest files**, by the space they really take (Docker's file reports far more than it uses).
+- **Full Disk Access:** Mail, Messages, Photos, Safari and the Trash are private; a banner links to the setting so they can be measured too.
+
+**Safe to clean:** Xcode DerivedData and archives, simulators and simulator runtimes, npm/pnpm/yarn/bun/pip/uv/Homebrew/CocoaPods/Gradle/Go/Cargo caches, Android emulator images, Docker build cache, unused images and stopped containers (volumes are kept), editor caches and backups for Cursor, VS Code and others (the editor must be closed), old downloads, build output in active projects (off by default), and `node_modules` and git-ignored build folders in projects you haven't opened lately. Nothing is deleted until you choose. Charts show the breakdown, free space before and after each cleanup, and free space over time.
+
+**Archive** for an old project:
+
+1. refuses if RepoGuard found malware in it, so it's never pushed
+2. saves its `.env` files to a note in the Notes folder "RepoGuard .env backups"
+3. commits unsaved work to a new `repoguard-archive-…` branch (`.env` files are never committed)
+4. pushes every branch and stash to GitHub without force, creating a private repo if it has none; a branch GitHub already moved past is pushed under a new name
+5. fetches and checks GitHub has every commit
+6. only then moves the folder to the Trash, or deletes it
+
+It stops and keeps the folder if anything fails, or if git-ignored files that can't be rebuilt (local databases, uploads) would be lost.
+
 ## Updating rules
 
 Edit `Resources/rules.json`, run `./build.sh install`, restart the app, then choose **Scan Now**.
@@ -53,6 +88,8 @@ Edit `Resources/rules.json`, run `./build.sh install`, restart the app, then cho
 tests/run_tests.sh /path/to/scratch                      # scanning
 REPOGUARD_TEST=1 tests/clean_tests.sh /path/to/scratch   # removing malware, fixing branches
 tests/github_watch_tests.sh /path/to/scratch             # GitHub watch, against a local mock API
+tests/mac_tests.sh /path/to/scratch                      # This Mac, against a fake home folder
+tests/storage_tests.sh /path/to/scratch                  # Cleanup and Archive, against local repos
 ```
 
 Tests use fake repos containing harmless copies of the malware's patterns. Delete `/path/to/scratch/rgtest` before rerunning `run_tests.sh`.
