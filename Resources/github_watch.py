@@ -250,13 +250,34 @@ def main():
     # the list of repos, refreshed every few hours
     if now - state.get("repo_list_time", 0) > REPO_LIST_EVERY or not state.get("repo_list"):
         try:
+            if not state.get("login"):
+                try:
+                    _, me, _ = gh.request("GET", "/user")
+                    state["login"] = (me or {}).get("login", "")
+                except GitHubError:
+                    pass
+            me = (state.get("login") or "").lower()
+
+            def watched(r):
+                if r.get("archived") or not (r.get("permissions") or {}).get("push"):
+                    return False
+                # Someone else's fork: write access comes only from the original repo, and its owner
+                # has to fix it. Watch the original instead.
+                owner = ((r.get("owner") or {}).get("login") or "").lower()
+                return not (r.get("fork") and owner != me)
+
             _, items, _ = gh.pages("/user/repos?per_page=100&affiliation=owner,collaborator,organization_member")
-            state["repo_list"] = sorted(r["full_name"] for r in items
-                                        if not r.get("archived") and (r.get("permissions") or {}).get("push"))
+            state["repo_list"] = sorted(r["full_name"] for r in items if watched(r))
             state["repo_list_time"] = now
         except GitHubError as e:
             out["errors"].append(f"couldn't list repos: {e}")
     repo_list = state.get("repo_list", [])
+    # Drop repos that are no longer watched (left, lost push access, someone else's fork) and their alerts.
+    listed = set(repo_list)
+    for name in [r for r in repos_state if r not in listed]:
+        repos_state.pop(name)
+    for key in [k for k, f in findings.items() if f["repo"] not in listed]:
+        findings.pop(key)
     out["repos"] = len(repo_list)
     first_run = not state.get("baseline_done")
 

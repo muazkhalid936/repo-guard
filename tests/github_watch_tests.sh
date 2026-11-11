@@ -2,6 +2,7 @@
 # Tests for the GitHub watch against a local fake GitHub. Usage: tests/github_watch_tests.sh SCRATCH_DIR
 ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgwatch; rm -rf "$T"; mkdir -p "$T/gh/acme"
 RES="$ROOT/Resources"; pass=0; fail=0; PORT=18765
+export SCAN_NO_NOTIFY=1  # the fake infected repos below would trip the global git scan hook's popup
 ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "PASS $1"; else fail=$((fail+1)); echo "FAIL $1: expected [$3], got [$2]"; fi; }
 PAD=$(printf ' %.0s' {1..150}); LOADER="var z = '-6752-3';"
 export REPOGUARD_GITHUB_API=http://127.0.0.1:$PORT REPOGUARD_GITHUB_TOKEN=test MOCK_PROTECTED=locked
