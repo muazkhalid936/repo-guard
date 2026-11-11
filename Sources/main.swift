@@ -38,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         model.start()
         GitHubWatcher.shared.onNewThreats = { [weak self] found, fixed in self?.alertGitHub(found, fixed) }
         GitHubWatcher.shared.start()
+        MacStore.shared.onNewThreats = { [weak self] found in self?.alertMac(found) }
+        MacStore.shared.start()
         // Setup can't be skipped, even when launched quietly at login.
         if !background || !model.setupDone { showWindow() }
     }
@@ -161,6 +163,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         a.addButton(withTitle: "Review")
         a.addButton(withTitle: "Dismiss")
         if a.runModal() == .alertFirstButtonReturn { showThreats() }
+    }
+
+    func alertMac(_ found: [ServerFinding]) {
+        if testMode || !model.popupsEnabled { return }
+        NSSound(named: "Basso")?.play()
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.alertStyle = .critical
+        a.messageText = "Malware found on this Mac"
+        a.informativeText = found.prefix(5).map { "• \($0.detail)" }.joined(separator: "\n") + "\n\nOpen This Mac to remove it. Everything removed is backed up first."
+        a.addButton(withTitle: "Open This Mac")
+        a.addButton(withTitle: "Dismiss")
+        if a.runModal() == .alertFirstButtonReturn { nav.screen = .mac; showWindow() }
     }
 
     func alert(_ found: [Finding]) {
