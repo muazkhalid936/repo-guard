@@ -579,7 +579,8 @@ struct FindingRow: View {
         switch f.kind {
         case "process": return "cpu"
         case "service": return "gearshape.2.fill"
-        case "autostart", "preload", "pm2": return "bolt.fill"
+        case "autostart", "preload", "pm2", "launchd", "shell", "cron": return "bolt.fill"
+        case "login": return "person.crop.circle.badge.exclamationmark"
         case "sshkeys": return "key.fill"
         case "tempfile": return "trash.fill"
         default: return "doc.text.fill"
