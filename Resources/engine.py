@@ -7,7 +7,7 @@ Run with `python3 -I` so nothing is loaded from the scanned folder.
   engine.py event --watch DIR [--watch DIR ...] --state FILE --rules FILE --log FILE --paths-file FILE
   engine.py ignore-active --state FILE
 """
-import argparse, datetime, hashlib, json, os, re, stat, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, stat, subprocess, sys, time
 
 GIT = "/usr/bin/git"
 GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -18,6 +18,10 @@ GIT_BASE = [GIT, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
 
 def under(path, folder):
     return path == folder or path.startswith(folder + os.sep)
+
+
+# folders where malware copies were deliberately saved during a cleanup; inert, not threats
+QUARANTINE = re.compile(r"quarantin", re.I)
 
 
 class Rules:
@@ -56,6 +60,8 @@ class Rules:
                 continue
             if scope == "code" and (vendored or not self.code.search(path)):
                 continue
+            if scope == "vscode" and not re.search(r"\.(?:jsonc?|code-workspace)$", path):
+                continue  # a scanner script that mentions "folderOpen" isn't an auto-run file
             need = rule.get("min_count", 1)
             matched = len(rule["rx"].findall(data)) >= need if need > 1 else bool(rule["rx"].search(data))
             if matched:
@@ -117,6 +123,15 @@ class Scanner:
         self.reviews = []
         self.files = 0
         self.repos = set()
+        self.rules_sig = hashlib.sha1(open(a.rules, "rb").read()).hexdigest() if a.rules else ""
+        self.cache = None       # path -> "size:ctime:inode" of files that were clean last full scan
+        self.new_cache = None
+        self.skipped = 0
+        self.progress_path = None  # set during a full scan so the app can show how far it got
+        self.progress_at = 0.0
+        self.phase = ""
+        self.blob_clean = None  # "blob sha|path" checked clean before; git contents never change for a sha
+        self.new_blobs = None
 
     def log(self, msg):
         if not self.log_path:
@@ -155,6 +170,14 @@ class Scanner:
             return  # deleted: its finding was just cleared
         if not stat.S_ISREG(st.st_mode):
             return
+        # Unchanged since the last full scan, which found it clean: skip re-reading it.
+        # ctime changes on any write or metadata change and can't be set back by a program.
+        stamp = f"{st.st_size}:{st.st_ctime_ns}:{st.st_ino}"
+        if self.cache is not None and self.cache.get(abspath) == stamp:
+            self.files += 1
+            self.skipped += 1
+            self.new_cache[abspath] = stamp
+            return
         data = None
         if st.st_size <= self.rules.max:
             try:
@@ -164,15 +187,19 @@ class Scanner:
                 return
         self.files += 1
         sig = hashlib.sha1(data).hexdigest() if data is not None else str(st.st_size)
-        for rule, sev, label in self.rules.check(rel, data):
+        hits = self.rules.check(rel, data)
+        for rule, sev, label in hits:
             self.add(root, rel, rule, sev, label, "folder", sig)
+        if not hits and self.new_cache is not None:
+            self.new_cache[abspath] = stamp
 
     def walk(self, root, top, repos_out=None):
         for cur, dirs, names in os.walk(top, followlinks=False):
             if repos_out is not None and ".git" in dirs + names:
                 repos_out.append(cur)
-            dirs[:] = [d for d in dirs if d != ".git" and d not in self.rules.skip_dirs]
+            dirs[:] = [d for d in dirs if d != ".git" and d not in self.rules.skip_dirs and not QUARANTINE.search(d)]
             owner = self.root_of(os.path.join(cur, "x"))
+            self.progress(owner)
             for n in names:
                 if n != ".git":
                     self.scan_file(owner, os.path.join(cur, n))
@@ -232,15 +259,24 @@ class Scanner:
     def scan_items(self, repo, items, where):
         by_sha = {}
         for s, p in items:
+            if self.blob_clean is not None and f"{s}|{p}" in self.blob_clean:
+                self.files += 1
+                self.skipped += 1
+                self.new_blobs.add(f"{s}|{p}")
+                continue
             by_sha.setdefault(s, []).append(p)
         for sha, data in read_blobs(repo, list(by_sha), self.rules.max):
             for p in by_sha[sha]:
                 self.files += 1
-                for rule, sev, label in self.rules.check(p, data):
+                hits = self.rules.check(p, data)
+                for rule, sev, label in hits:
                     self.add(repo, p, rule, sev, label, where, sha)
+                if not hits and self.new_blobs is not None:
+                    self.new_blobs.add(f"{sha}|{p}")
 
     def scan_refs(self, repo, force=False):
         self.repos.add(repo)
+        self.progress(repo)
         rc, out = git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype)")
         if rc:
             return
@@ -316,12 +352,54 @@ class Scanner:
     def in_failed(self, path):
         return any(under(path, w) for w in self.failed)
 
+    CACHE_MAX_AGE = 24 * 3600  # read every file again at least once a day
+
+    def load_cache(self):
+        try:
+            c = json.load(open(self.state_path + ".files"))
+            if c.get("rules") == self.rules_sig:
+                self.blob_clean = set(c.get("blobs", []))
+                if time.time() - c.get("time", 0) < self.CACHE_MAX_AGE:
+                    self.cache = c["files"]
+                    self.cache_time = c["time"]
+        except (OSError, ValueError, KeyError):
+            pass
+        self.new_cache = {}
+        self.new_blobs = set()
+
+    def save_cache(self):
+        tmp = self.state_path + ".files.tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"rules": self.rules_sig, "time": getattr(self, "cache_time", None) or time.time(), "files": self.new_cache,
+                       "blobs": sorted(self.new_blobs)}, fh)
+        os.replace(tmp, self.state_path + ".files")
+
+    def progress(self, where, force=False):
+        if not self.progress_path:
+            return
+        now = time.time()
+        if not force and now - self.progress_at < 0.4:
+            return
+        self.progress_at = now
+        expected = (self.state.get("last_full") or {}).get("files") or 0
+        try:
+            with open(self.progress_path + ".tmp", "w") as fh:
+                json.dump({"files": self.files, "expected": expected, "phase": self.phase, "where": where}, fh)
+            os.replace(self.progress_path + ".tmp", self.progress_path)
+        except OSError:
+            pass
+
     def full(self):
         self.check_access()
+        self.load_cache()
+        self.progress_path = self.state_path + ".progress"
+        self.phase = "files"
+        self.progress("", force=True)
         repos = []
         for w in self.watches:
             if w not in self.failed:
                 self.walk(w, w, repos)
+        self.phase = "branches"
         for repo in repos:
             self.scan_config(repo)
             self.scan_refs(repo, force=True)
@@ -329,15 +407,24 @@ class Scanner:
         # Results from a folder we can't read right now are kept, because nothing proved them fixed.
         for gone in [r for r in self.state["refs"] if r not in known and not self.in_failed(r)]:
             del self.state["refs"][gone]
-        # Clear findings from folders that no longer exist or are no longer watched.
+        # Clear findings from folders that no longer exist or are no longer watched,
+        # and from files that were deleted since they were flagged.
         for k, f in list(self.state["findings"].items()):
             if self.in_failed(f["root"]):
                 continue
             if not os.path.exists(f["root"]) or not self.watch_for(f["root"] + os.sep + "x"):
                 del self.state["findings"][k]
+            elif f["where"] == "folder" and not os.path.lexists(os.path.join(f["root"], f["path"])):
+                del self.state["findings"][k]
         self.state["reviews"] = [r for r in self.state.get("reviews", [])
                                  if self.in_failed(r["root"]) or (os.path.exists(r["root"]) and self.watch_for(r["root"] + os.sep + "x"))]
-        self.state["last_full"] = {"files": self.files, "time": datetime.datetime.now().isoformat(timespec="seconds")}
+        self.state["last_full"] = {"files": self.files, "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                                   "reread": self.files - self.skipped}
+        self.save_cache()
+        try:
+            os.remove(self.progress_path)
+        except OSError:
+            pass
 
     def repo_info(self):
         """Summary for the app's Repositories screen. Reads .git/HEAD as text only."""
@@ -365,7 +452,7 @@ class Scanner:
                 continue
             rel = os.path.relpath(p, watch)
             parts = rel.split(os.sep)
-            if any(x in self.rules.skip_dirs for x in parts):
+            if any(x in self.rules.skip_dirs or QUARANTINE.search(x) for x in parts):
                 continue
             if ".git" in parts:
                 i = parts.index(".git")
@@ -412,7 +499,7 @@ class Scanner:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["full", "event", "ignore-active"])
+    ap.add_argument("mode", choices=["full", "event", "ignore-active", "status"])
     ap.add_argument("--watch", action="append", default=[])
     ap.add_argument("--state", required=True)
     ap.add_argument("--rules", default="")
@@ -427,6 +514,11 @@ def main():
         print(json.dumps({"new": [], "active": [], "reviews": [], "files": 0, "repos": 0}))
         return
     sc = Scanner(a)
+    if a.mode == "status":  # last saved results, instantly, without scanning or writing anything
+        print(json.dumps({"new": [], "active": list(sc.state["findings"].values()), "reviews": [], "files": 0, "repos": 0,
+                          "repo_info": sc.repo_info(), "recent_reviews": sc.state.get("reviews", []),
+                          "last_full": sc.state.get("last_full"), "errors": []}))
+        return
     if a.mode == "full":
         sc.full()
     else:

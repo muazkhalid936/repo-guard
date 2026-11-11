@@ -14,7 +14,7 @@ struct Finding: Decodable, Identifiable, Hashable {
     let `where`: String
     let time: String?
     var id: String { key }
-    var repoName: String { (root as NSString).lastPathComponent }
+    var repoName: String { projectName(root) }
     var location: String { describeLocation(`where`) }
 }
 
@@ -25,7 +25,7 @@ struct ReviewItem: Decodable, Identifiable, Hashable {
     let `where`: String
     let time: String?
     var id: String { "\(root)|\(path)|\(label)" }
-    var repoName: String { (root as NSString).lastPathComponent }
+    var repoName: String { projectName(root) }
 }
 
 struct RepoInfo: Decodable, Identifiable, Hashable {
@@ -34,10 +34,24 @@ struct RepoInfo: Decodable, Identifiable, Hashable {
     let branches: Int
     let threats: Int
     var id: String { path }
-    var name: String { (path as NSString).lastPathComponent }
+    var name: String { projectName(path) }
+}
+
+struct CleanSummary: Decodable {
+    let files: Int
+    let refs: Int
+    let manual: Int
+    let skipped: Int
+    let kept_tags: Int
+    let fetch_failed: Int
+    let purged: Int
+    let backup: String
+    var pushed: Int? = 0
+    var manual_items: [String]? = []
 }
 
 struct LastFull: Decodable { let files: Int; let time: String }
+struct ScanProgress: Decodable, Equatable { let files: Int; let expected: Int; let phase: String; let `where`: String }
 
 struct ScanResult: Decodable {
     let new: [Finding]
@@ -50,8 +64,33 @@ struct ScanResult: Decodable {
     let errors: [String]?
 }
 
+/// The engine writes local times like 2026-11-11T15:31:34.
+func parseEngineTime(_ s: String) -> Date? {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    return f.date(from: s)
+}
+
+/// "acme/backend" instead of just "backend": the folder plus its parent, unless the parent is a watched folder.
+func projectName(_ path: String) -> String {
+    let watched = Set((UserDefaults.standard.stringArray(forKey: "watchDirs") ?? []).map { ($0 as NSString).standardizingPath })
+    let p = (path as NSString).standardizingPath
+    let parent = (p as NSString).deletingLastPathComponent
+    let name = (p as NSString).lastPathComponent
+    if watched.contains(parent) || parent == home || parent == "/" { return name }
+    return "\((parent as NSString).lastPathComponent)/\(name)"
+}
+
+struct DayStat: Identifiable, Hashable {
+    let day: Date
+    let kind: String  // "Found" or "Removed"
+    let count: Int
+    var id: String { "\(day.timeIntervalSince1970)\(kind)" }
+}
+
 struct LogEntry: Identifiable, Hashable {
-    enum Kind { case threat, review, scan, error }
+    enum Kind { case threat, review, scan, error, fixed }
     let id: Int
     let time: String
     let kind: Kind
@@ -66,7 +105,12 @@ func describeLocation(_ w: String) -> String {
     }
     if w == "folder" { return "In the files on disk" }
     if w == "git-config" { return "In the repo's Git settings" }
-    if w.hasPrefix("branch:") { return "On branch \(short(String(w.dropFirst(7))))" }
+    if w.hasPrefix("branch:") {
+        let r = String(w.dropFirst(7))
+        if r.hasPrefix("refs/remotes/") { return "Only in GitHub branch \(short(r)), not in your files" }
+        if r.hasPrefix("refs/tags/") { return "Only in git \(short(r)), not in your files" }
+        return "In git branch \(short(r)) (switch to it and the file comes back)"
+    }
     if w.hasPrefix("incoming:") { return "In new commits on \(short(String(w.dropFirst(9))))" }
     return w
 }
@@ -91,11 +135,17 @@ final class AppModel: ObservableObject {
     @Published var reviews: [ReviewItem] = []
     @Published var repos: [RepoInfo] = []
     @Published var activity: [LogEntry] = []
+    @Published var daily: [DayStat] = []
     @Published var filesChecked = 0
     @Published var lastScan: Date?
     @Published var scanning = false
+    /// How far the running full scan got, read from the engine's progress file.
+    @Published var progress: ScanProgress?
+    private var progressTimer: Timer?
     @Published var lastError: String?
     @Published var loaded = false
+    @Published var cleaning = false
+    @Published var cleanSummary: CleanSummary?
     @Published var watchDirs: [String]
     @Published var setupDone: Bool
     @Published var launchAtLogin = FileManager.default.fileExists(atPath: agentPath)
@@ -132,11 +182,17 @@ final class AppModel: ObservableObject {
     }
 
     var isProtected: Bool { lastError == nil }
+
+    var scanLabel: String {
+        guard let p = progress, p.expected > 0 else { return "Scanning…" }
+        return "Scanning… \(min(99, p.files * 100 / p.expected))%"
+    }
     var threatRepoCount: Int { Set(active.map(\.root)).count }
 
     func start() {
         try? FileManager.default.createDirectory(atPath: supportDir, withIntermediateDirectories: true)
         refreshActivity()
+        loadSaved()
         guard setupDone else {
             lastError = "Choose the folders where your repos are."
             onChange?()
@@ -241,6 +297,60 @@ final class AppModel: ObservableObject {
 
     func scanNow() { run(mode: "full", paths: nil) }
 
+    /// Cuts the malware out of files and git history, backs up every original, then rescans.
+    func removeMalware(permanent: Bool, fixGithub: Bool = false) {
+        scanQueue.async { [weak self] in
+            guard let self = self else { return }
+            DispatchQueue.main.async { self.cleaning = true; self.cleanSummary = nil; self.onChange?() }
+            let summary = self.runCleaner(permanent: permanent, fixGithub: fixGithub)
+            DispatchQueue.main.async {
+                self.cleaning = false
+                switch summary {
+                case .success(let s): self.cleanSummary = s
+                case .failure(let e): self.lastError = e.localizedDescription
+                }
+                self.onChange?()
+            }
+            self.run(mode: "full", paths: nil)
+        }
+    }
+
+    var cleanReportPath: String { "\(supportDir)/quarantine/last-clean.json" }
+
+    func openCleanReport() { NSWorkspace.shared.open(URL(fileURLWithPath: cleanReportPath)) }
+
+    private func runCleaner(permanent: Bool, fixGithub: Bool) -> Result<CleanSummary, Error> {
+        guard let cleaner = Bundle.main.path(forResource: "cleaner", ofType: "py"),
+              let rules = Bundle.main.path(forResource: "rules", ofType: "json") else {
+            return .failure(NSError(domain: "RepoGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: "The cleaner is missing. Reinstall RepoGuard."]))
+        }
+        let backup = "\(supportDir)/quarantine"
+        try? FileManager.default.createDirectory(atPath: backup, withIntermediateDirectories: true)
+        var args = ["-I", cleaner, "--state", "\(supportDir)/state.json", "--rules", rules, "--backup", backup, "--log", logFile]
+        if permanent { args.append("--permanent") }
+        if fixGithub { args.append("--fix-github") }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = args
+        p.currentDirectoryURL = URL(fileURLWithPath: "/")
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        do { try p.run() } catch { return .failure(error) }
+        var errData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        group.wait()
+        if p.terminationStatus != 0 {
+            appendLog("CLEANER ERROR: \(String(data: errData, encoding: .utf8) ?? "")")
+            return .failure(NSError(domain: "RepoGuard", code: 4, userInfo: [NSLocalizedDescriptionKey: "Removing malware failed. See Activity for details."]))
+        }
+        do { return .success(try JSONDecoder().decode(CleanSummary.self, from: data)) } catch { return .failure(error) }
+    }
+
     func markAllFalseAlarm() {
         scanQueue.async { [weak self] in
             guard let self = self else { return }
@@ -249,13 +359,52 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Shows the results saved by the last scan straight away, instead of an empty window
+    /// while a full scan runs. Reads only; runs beside the scan queue, not behind it.
+    private func loadSaved() {
+        guard FileManager.default.fileExists(atPath: "\(supportDir)/state.json") else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self, case .success(let r) = self.execute(mode: "status", paths: nil) else { return }
+            DispatchQueue.main.async {
+                guard self.lastScan == nil else { return }  // a real scan already finished
+                self.active = r.active
+                if let info = r.repo_info { self.repos = info }
+                if let rv = r.recent_reviews { self.reviews = rv.reversed() }
+                if let lf = r.last_full {
+                    self.filesChecked = lf.files
+                    self.lastScan = parseEngineTime(lf.time)
+                }
+                self.loaded = true
+                self.onChange?()
+            }
+        }
+    }
+
+    private func watchProgress(_ on: Bool) {
+        progressTimer?.invalidate()
+        progressTimer = nil
+        progress = nil
+        guard on else { return }
+        let path = "\(supportDir)/state.json.progress"
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self, let data = FileManager.default.contents(atPath: path),
+                  let p = try? JSONDecoder().decode(ScanProgress.self, from: data), p != self.progress else { return }
+            self.progress = p
+        }
+    }
+
     private func run(mode: String, paths: [String]?) {
         scanQueue.async { [weak self] in
             guard let self = self else { return }
-            DispatchQueue.main.async { self.scanning = true; self.onChange?() }
+            DispatchQueue.main.async {
+                self.scanning = true
+                if mode == "full" { self.watchProgress(true) }
+                self.onChange?()
+            }
             let result = self.execute(mode: mode, paths: paths)
             DispatchQueue.main.async {
                 self.scanning = false
+                if mode == "full" { self.watchProgress(false) }
                 self.loaded = true
                 switch result {
                 case .success(let r):
@@ -323,8 +472,27 @@ final class AppModel: ObservableObject {
 
     func refreshActivity() {
         guard let text = try? String(contentsOfFile: logFile, encoding: .utf8) else { return }
-        let lines = text.split(separator: "\n").suffix(400)
+        let all = text.split(separator: "\n")
+        let lines = all.suffix(400)
         var out: [LogEntry] = []
+        // daily found/removed counts for the dashboard chart
+        let cal = Calendar.current
+        let start = cal.date(byAdding: .day, value: -13, to: cal.startOfDay(for: Date()))!
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"
+        var found: [Date: Int] = [:], removed: [Date: Int] = [:]
+        for raw in all where raw.count > 20 {
+            guard let d = df.date(from: String(raw.prefix(10))), d >= start else { continue }
+            let b = raw.dropFirst(20)
+            if b.hasPrefix("THREAT ") || b.hasPrefix("GITHUB THREAT ") || (b.hasPrefix("SERVER SCAN") && !b.contains(": 0 threats")) { found[d, default: 0] += 1 }
+            else if b.hasPrefix("CLEANED ") || b.hasPrefix("GITHUB FIXED ") || b.hasPrefix("SERVER CLEANED ") { removed[d, default: 0] += 1 }
+        }
+        var stats: [DayStat] = []
+        for i in 0..<14 {
+            let d = cal.date(byAdding: .day, value: i, to: start)!
+            stats.append(DayStat(day: d, kind: "Found", count: found[d] ?? 0))
+            stats.append(DayStat(day: d, kind: "Removed", count: removed[d] ?? 0))
+        }
+        daily = stats
         for (i, raw) in lines.enumerated() {
             let line = String(raw)
             let time = line.count > 19 ? String(line.prefix(19)) : ""
@@ -336,6 +504,10 @@ final class AppModel: ObservableObject {
                 if body.contains("new=0"), let f = body.range(of: "files="), let num = Int(body[f.upperBound...].prefix(while: \.isNumber)), num < 50 { continue }
                 out.append(LogEntry(id: i, time: time, kind: .scan, text: humanScan(body)))
             }
+            else if body.hasPrefix("GITHUB THREAT ") { out.append(LogEntry(id: i, time: time, kind: .threat, text: "GitHub: " + String(body.dropFirst(14)))) }
+            else if body.hasPrefix("GITHUB FIXED ") { out.append(LogEntry(id: i, time: time, kind: .fixed, text: "GitHub fixed: " + String(body.dropFirst(13)))) }
+            else if body.hasPrefix("CLEANED ") { out.append(LogEntry(id: i, time: time, kind: .fixed, text: shortenPaths(String(body.dropFirst(8))))) }
+            else if body.hasPrefix("SERVER ") { out.append(LogEntry(id: i, time: time, kind: body.contains("CLEANED") ? .fixed : (body.contains("ERROR") ? .error : .scan), text: "Server " + String(body.dropFirst(7)))) }
             else if body.hasPrefix("FOLDER ERROR ") { out.append(LogEntry(id: i, time: time, kind: .error, text: String(body.dropFirst(13)))) }
             else if line.contains("ENGINE ERROR") { out.append(LogEntry(id: i, time: "", kind: .error, text: "A scan failed: \(line.replacingOccurrences(of: "ENGINE ERROR: ", with: ""))")) }
         }
@@ -352,15 +524,16 @@ final class AppModel: ObservableObject {
             return String(body[r.upperBound...].prefix(while: \.isNumber))
         }
         let new = value("new")
-        return "Scanned \(value("files")) files in \(value("repos")) repos" + (new == "0" ? ", nothing new" : ", \(new) new threats")
+        return "Scanned \(value("files")) files in \(value("repos")) repos" + (new == "0" ? ", no new threats" : ", \(new) new threats")
     }
 
     // MARK: actions
 
     func reveal(_ f: Finding) {
         let path = "\(f.root)/\(f.path)"
-        let target = FileManager.default.fileExists(atPath: path) ? path : f.root
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: target)])
+        guard FileManager.default.fileExists(atPath: path) else { NSWorkspace.shared.open(URL(fileURLWithPath: f.root)); return }
+        // Finder hides dot-files (.gitignore, .vscode); open the folder that holds it with the file selected
+        NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: (path as NSString).deletingLastPathComponent)
     }
 
     func revealFolder(_ path: String) {
