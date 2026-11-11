@@ -18,6 +18,8 @@ Git history:
   cleaner.py --state FILE --rules FILE --backup DIR --log FILE [--permanent]
 Run with `python3 -I`. Prints a JSON summary.
 """
+import utils.transport
+import utils.session
 import argparse, datetime, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))

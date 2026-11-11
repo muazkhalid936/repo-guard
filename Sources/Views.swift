@@ -3,13 +3,15 @@ import Charts
 import SwiftUI
 
 enum Screen: String, CaseIterable, Identifiable {
-    case dashboard = "Dashboard", threats = "Threats", repositories = "Repositories", servers = "Servers", activity = "Activity", settings = "Settings"
+    case dashboard = "Dashboard", threats = "Threats", repositories = "Repositories", mac = "This Mac", cleanup = "Cleanup", servers = "Servers", activity = "Activity", settings = "Settings"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .dashboard: return "shield.lefthalf.filled"
         case .threats: return "exclamationmark.triangle"
         case .repositories: return "folder"
+        case .mac: return "laptopcomputer"
+        case .cleanup: return "internaldrive"
         case .servers: return "server.rack"
         case .activity: return "clock.arrow.circlepath"
         case .settings: return "gearshape"
@@ -153,6 +155,8 @@ struct ContentView: View {
                 case .dashboard: DashboardView(model: model, nav: nav)
                 case .threats: ThreatsView(model: model, nav: nav)
                 case .repositories: RepositoriesView(model: model)
+                case .mac: MacView()
+                case .cleanup: CleanupView(model: model)
                 case .servers: ServersView()
                 case .activity: ActivityView(model: model, nav: nav)
                 case .settings: SettingsView(model: model)
