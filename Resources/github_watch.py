@@ -37,6 +37,22 @@ HOT = re.compile(r"(?:^|/)(?:\.gitignore|package\.json|init|conftest\.py|session
                  r"|[^/]*\.orc|(?:public|assets|static)/fonts/[^/]+|config\.bat|temp_[a-z_]+\.bat)$")
 
 
+# RepoGuard's own repo: its detection code and tests spell out the malware's names, addresses and
+# loader lines on purpose, so those files would always match the rules that look for that text.
+# Only those exact files and only those rules are skipped. Hidden off-screen code and obfuscation
+# are still caught in them, and every other file in the repo (a planted utils/session.py, say)
+# is checked normally.
+SELF_REPO = re.compile(r"(?:^|/)repo-?guard$", re.I)
+SELF_FILES = re.compile(r"^(?:Resources/(?:engine|cleaner|server_agent|mac_agent|github_watch|storage)\.py"
+                        r"|Resources/rules\.json|tests/[^/]+\.(?:sh|py))$")
+SIGNATURE_RULES = {"known_code", "known_host", "loader_lines", "eth_loader", "autorun", "encoded_exec",
+                   "npm_loader", "gitignore_marker"}
+
+
+def exempt(repo, path, rule):
+    return bool(SELF_REPO.search(repo) and SELF_FILES.match(path) and rule in SIGNATURE_RULES)
+
+
 class GitHubError(Exception):
     def __init__(self, status, msg):
         super().__init__(f"GitHub {status}: {msg}")
@@ -122,6 +138,9 @@ class Scanner:
         return base64.b64decode(data["content"]) if data.get("encoding") == "base64" else data["content"].encode()
 
     def check(self, repo, path, sha, size):
+        return [h for h in self._check(repo, path, sha, size) if not exempt(repo, path, h[0])]
+
+    def _check(self, repo, path, sha, size):
         if self.rules.vendored.search(path):
             return []
         key = f"{sha}|{path}"  # some rules depend on the name, so cache per name too
@@ -278,6 +297,15 @@ def main():
         repos_state.pop(name)
     for key in [k for k, f in findings.items() if f["repo"] not in listed]:
         findings.pop(key)
+    # Re-apply the exemptions to alerts saved before they existed (the branch may not move again).
+    for key, f in list(findings.items()):
+        hits = {p: [x for x in h if not exempt(f["repo"], p, x[0])] for p, h in f.get("hits", {}).items()}
+        hits = {p: h for p, h in hits.items() if h}
+        if not hits:
+            findings.pop(key)
+        elif hits != f.get("hits"):
+            f["hits"], f["files"] = hits, sorted(hits)
+            f["labels"] = sorted({x[2] for h in hits.values() for x in h})
     out["repos"] = len(repo_list)
     first_run = not state.get("baseline_done")
 

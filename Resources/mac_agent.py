@@ -133,6 +133,14 @@ def signer(path):
             who = "Developer ID: " + first.split(":", 1)[1].strip()
         elif first.startswith("Apple Mac OS Application Signing"):
             who = "App Store"
+        elif first.startswith("Apple iPhone OS Application Signing"):
+            # An iPhone/iPad app from the App Store or TestFlight. macOS runs these from a wrapper in
+            # /private/var/folders/.../Wrapper/, which looks like a temp folder. `codesign -dv` only
+            # reports what the signature claims, so check it really is Apple's. --no-strict because
+            # iPhone apps use resource rules that strict checking always rejects.
+            req = 'anchor apple generic and certificate leaf[subject.CN] = "Apple iPhone OS Application Signing"'
+            rc2, _, _ = run(["/usr/bin/codesign", "--verify", "--no-strict", f"-R={req}", path])
+            who = "App Store (iPhone app)" if rc2 == 0 else "invalid signature"
         elif first.startswith("Software Signing"):
             who = "Apple"
         elif first:
@@ -151,7 +159,7 @@ def signer(path):
 
 
 def trusted(who):
-    return who in ("Apple", "App Store", "Homebrew", "needs admin to check") or who.startswith("Developer ID")
+    return who in ("Apple", "App Store", "App Store (iPhone app)", "Homebrew", "needs admin to check") or who.startswith("Developer ID")
 
 
 def norm(p):
@@ -416,7 +424,7 @@ def scan_processes(out):
         elif place:
             who = signer(exe)
             if not trusted(who):
-                why = f"unsigned program running from {place}"
+                why = f"{'unsigned' if who in ('unsigned', 'ad-hoc', 'missing') else 'untrusted'} program running from {place}"
                 if place == "a temp folder" and not os.path.basename(exe).startswith("."):
                     sev = "review"  # build tools (go run, swift) run unsigned binaries from temp folders too
         elif REMOTE_TOOLS.search(exe):
