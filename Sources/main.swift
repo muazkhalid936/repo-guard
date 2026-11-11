@@ -36,6 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         model.onChange = { [weak self] in self?.updateIcon() }
         model.onNewThreats = { [weak self] found in self?.alert(found) }
         model.start()
+        GitHubWatcher.shared.onNewThreats = { [weak self] found, fixed in self?.alertGitHub(found, fixed) }
+        GitHubWatcher.shared.start()
         // Setup can't be skipped, even when launched quietly at login.
         if !background || !model.setupDone { showWindow() }
     }
@@ -100,10 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         guard let button = statusItem?.button else { return }
         let threat = !model.active.isEmpty
         let name = threat ? "exclamationmark.shield.fill" : (model.lastError != nil ? "shield.slash" : "checkmark.shield")
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "RepoGuard")
-        image?.isTemplate = !threat
+        var image = NSImage(systemSymbolName: name, accessibilityDescription: "RepoGuard")
+        if threat {
+            // white mark on a red shield: readable on light and dark menu bars and over any wallpaper
+            image = image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.white, .systemRed]))
+            image?.isTemplate = false
+        } else {
+            image?.isTemplate = true  // follows the menu bar: black on light, white on dark
+        }
         button.image = image
-        button.contentTintColor = threat ? .systemRed : nil
+        button.contentTintColor = nil
         button.title = threat ? " \(model.active.count)" : ""
         button.toolTip = threat ? "RepoGuard: \(model.active.count) threats" : (model.lastError != nil ? "RepoGuard: not protected" : "RepoGuard: all clear")
     }
@@ -138,6 +146,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func scanNow() { model.scanNow() }
     @objc func quit() { NSApp.terminate(nil) }
 
+    func alertGitHub(_ found: [GHFinding], _ fixed: [GHFix]) {
+        model.refreshActivity()
+        if testMode || !model.popupsEnabled { return }
+        NSSound(named: "Basso")?.play()
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.alertStyle = .critical
+        let fixedSet = Set(fixed.map { "\($0.repo)|\($0.branch)" })
+        a.messageText = fixed.isEmpty ? "Malware pushed to GitHub" : "Malware pushed to GitHub and removed"
+        a.informativeText = found.prefix(6).map { f in
+            "• \(f.repo) · \(f.branch)\n   \(f.files.prefix(3).joined(separator: ", "))" + (fixedSet.contains(f.id) ? "\n   Removed with a cleanup commit." : "")
+        }.joined(separator: "\n") + "\n\nSomeone with access to your GitHub pushed this. Don't pull these branches until they're clean, and check which tokens or machines can push."
+        a.addButton(withTitle: "Review")
+        a.addButton(withTitle: "Dismiss")
+        if a.runModal() == .alertFirstButtonReturn { showThreats() }
+    }
+
     func alert(_ found: [Finding]) {
         if testMode || !model.popupsEnabled { return }
         NSSound(named: "Basso")?.play()
@@ -165,6 +190,12 @@ func writeSnapshots(to dir: String) {
         m.loaded = true
         m.lastScan = Date()
         m.filesChecked = 3303
+        let cal = Calendar.current
+        m.daily = (0..<14).flatMap { i -> [DayStat] in
+            let d = cal.date(byAdding: .day, value: i - 13, to: cal.startOfDay(for: Date()))!
+            return [DayStat(day: d, kind: "Found", count: threats ? [0,0,3,1,0,5,2,0,0,8,4,1,0,2][i] : 0),
+                    DayStat(day: d, kind: "Removed", count: threats ? [0,0,1,1,0,4,2,0,0,6,4,0,0,1][i] : [0,0,1,0,0,2,0,0,0,3,0,0,0,0][i])]
+        }
         m.lastError = failed ? "RepoGuard can't read this folder. Allow access in System Settings." : nil
         m.repos = [RepoInfo(path: "\(home)/Documents/github/tsk-diet", branch: "main", branches: 2, threats: threats ? 2 : 0),
                    RepoInfo(path: "\(home)/Documents/github/ask-biz", branch: "main", branches: 2, threats: 0),
@@ -214,11 +245,61 @@ func writeSnapshots(to dir: String) {
     render("4-repositories", sampleModel(threats: true), .repositories)
     render("5-activity", sampleModel(threats: true), .activity)
     render("6-settings", sampleModel(threats: false), .settings)
+    for (n, auth) in [("13-editor-ec2", AuthKind.ec2Connect), ("14-editor-password", AuthKind.password)] {
+        var srv = Server(); srv.name = "Example - EC2"; srv.host = "203.0.113.10"; srv.user = "ubuntu"; srv.auth = auth
+        srv.awsProfile = "Couplein"; srv.awsRegion = "eu-north-1"; srv.instanceId = "i-0bcdfb461ee23eb2b"
+        let host = NSHostingView(rootView: ServerEditor(server: srv, store: serverStore))
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 640), styleMask: [.titled], backing: .buffered, defer: false)
+        w.appearance = NSAppearance(named: .darkAqua); w.contentView = host; w.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+        if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/\(n).png"))
+        }
+    }
+    render("10-servers", sampleModel(threats: true), .servers)
+    render("11-servers-dark", sampleModel(threats: true), .servers, dark: true)
+    render("12-dashboard-threats-dark", sampleModel(threats: true), .dashboard, dark: true)
     render("7-dashboard-dark", sampleModel(threats: false), .dashboard, dark: true)
     render("8-not-protected", sampleModel(threats: false, failed: true), .dashboard)
 }
 
+// A closed SSH pipe must not kill the app; the write fails and the error is reported instead.
+signal(SIGPIPE, SIG_IGN)
+
+// Test hook: REPOGUARD_SERVER_TEST=scan|clean with a server JSON file runs the real SSH path and prints the report.
+if let mode = env["REPOGUARD_SERVER_TEST"], let file = env["REPOGUARD_SERVER_FILE"],
+   let d = FileManager.default.contents(atPath: file), let s = try? JSONDecoder().decode(Server.self, from: d) {
+    if let pw = env["REPOGUARD_TEST_PASSWORD"] { Keychain.set(pw, for: "\(s.id).ssh") }
+    let ids = (env["REPOGUARD_SERVER_IDS"] ?? "").split(separator: ",").map(String.init)
+    let roots = s.roots.split(separator: " ").map(String.init)
+    let args = (mode == "clean" ? ["clean", "--ids"] + ids : ["scan"]) + ["--roots"] + roots
+    switch serverStore.runAgentForTest(s, args: args) {
+    case .success(let r): print(String(data: (try? JSONEncoder().encode(r)) ?? Data(), encoding: .utf8) ?? "")
+    case .failure(let e): print("ERROR: \(e.localizedDescription)")
+    }
+    if env["REPOGUARD_TEST_PASSWORD"] != nil { Keychain.delete("\(s.id).ssh") }
+    exit(0)
+}
+
 let app = NSApplication.shared
+// Design check: shows the server editor on screen and saves a screenshot of it.
+if let out = env["REPOGUARD_EDITOR_PREVIEW"] {
+    app.setActivationPolicy(.regular)
+    var srv = Server(); srv.name = "Example - EC2"; srv.host = "203.0.113.10"; srv.user = "ubuntu"
+    srv.auth = env["REPOGUARD_EDITOR_AUTH"] == "password" ? .password : .ec2Connect
+    srv.awsProfile = "Couplein"; srv.awsRegion = "eu-north-1"; srv.instanceId = "i-0bcdfb461ee23eb2b"
+    let w = NSWindow(contentRect: NSRect(x: 200, y: 100, width: 620, height: 820), styleMask: [.titled], backing: .buffered, defer: false)
+    w.appearance = NSAppearance(named: env["REPOGUARD_EDITOR_LIGHT"] != nil ? .aqua : .darkAqua)
+    w.contentView = NSHostingView(rootView: ServerEditor(server: srv, store: serverStore))
+    w.makeKeyAndOrderFront(nil)
+    app.activate(ignoringOtherApps: true)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+        _ = runProcess("/usr/sbin/screencapture", ["-x", "-o", "-l", String(w.windowNumber), out])
+        exit(0)
+    }
+    app.run()
+}
 if let dir = env["REPOGUARD_SNAPSHOT"] {
     app.setActivationPolicy(.accessory)
     writeSnapshots(to: dir)
