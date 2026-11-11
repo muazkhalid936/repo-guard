@@ -1,14 +1,16 @@
 import AppKit
+import Charts
 import SwiftUI
 
 enum Screen: String, CaseIterable, Identifiable {
-    case dashboard = "Dashboard", threats = "Threats", repositories = "Repositories", activity = "Activity", settings = "Settings"
+    case dashboard = "Dashboard", threats = "Threats", repositories = "Repositories", servers = "Servers", activity = "Activity", settings = "Settings"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .dashboard: return "shield.lefthalf.filled"
         case .threats: return "exclamationmark.triangle"
         case .repositories: return "folder"
+        case .servers: return "server.rack"
         case .activity: return "clock.arrow.circlepath"
         case .settings: return "gearshape"
         }
@@ -18,12 +20,13 @@ enum Screen: String, CaseIterable, Identifiable {
 final class Navigation: ObservableObject {
     @Published var screen: Screen? = .dashboard
     @Published var confirmingFalseAlarm = false
+    @Published var confirmingClean = false
     @Published var activityFilter = 0
 }
 
-private let safeGreen = Color(red: 0.11, green: 0.62, blue: 0.40)
-private let dangerRed = Color(red: 0.84, green: 0.20, blue: 0.20)
-private let cautionOrange = Color(red: 0.90, green: 0.55, blue: 0.12)
+let safeGreen = Color(red: 0.11, green: 0.62, blue: 0.40)
+let dangerRed = Color(red: 0.84, green: 0.20, blue: 0.20)
+let cautionOrange = Color(red: 0.90, green: 0.55, blue: 0.12)
 
 // MARK: root
 
@@ -150,6 +153,7 @@ struct ContentView: View {
                 case .dashboard: DashboardView(model: model, nav: nav)
                 case .threats: ThreatsView(model: model, nav: nav)
                 case .repositories: RepositoriesView(model: model)
+                case .servers: ServersView()
                 case .activity: ActivityView(model: model, nav: nav)
                 case .settings: SettingsView(model: model)
                 }
@@ -202,7 +206,7 @@ struct Sidebar: View {
         .padding(.bottom, 8)
         .frame(width: 212)
         .frame(maxHeight: .infinity)
-        .background(Color.primary.opacity(0.035))
+        .background(.thinMaterial)
     }
 }
 
@@ -257,10 +261,24 @@ struct Card<Content: View>: View {
         content()
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color(NSColor.controlBackgroundColor)))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+            .modifier(GlassCard())
     }
 }
+
+/// Liquid Glass on macOS 26+, a frosted material card before that.
+struct GlassCard: ViewModifier {
+    var radius: CGFloat = 16
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            content
+                .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(.regularMaterial))
+                .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).stroke(Color.primary.opacity(0.08)))
+        }
+    }
+}
+
 
 struct EmptyState: View {
     let icon: String
@@ -300,6 +318,36 @@ struct HeroButtonStyle: ButtonStyle {
     }
 }
 
+/// A thin bar under the header while a full scan runs; results from the last scan stay on screen meanwhile.
+struct ScanProgressBar: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        if model.scanning, let p = model.progress {
+            Card {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack {
+                        Text(p.phase == "branches" ? "Checking git branches" : "Checking files")
+                            .font(.callout.weight(.medium))
+                        if !p.where.isEmpty {
+                            Text(projectName(p.where)).font(.callout).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
+                        }
+                        Spacer()
+                        Text(p.expected > 0 ? "\(p.files.formatted()) of ~\(p.expected.formatted())" : "\(p.files.formatted()) files")
+                            .font(.callout.monospacedDigit()).foregroundColor(.secondary)
+                    }
+                    if p.expected > 0 {
+                        ProgressView(value: min(Double(p.files), Double(p.expected)), total: Double(p.expected))
+                    } else {
+                        ProgressView().progressViewStyle(.linear)
+                    }
+                    Text("Showing results from the last scan until this one finishes.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
 struct ScanButton: View {
     @ObservedObject var model: AppModel
     var prominent = false
@@ -313,7 +361,7 @@ struct ScanButton: View {
                 } else {
                     Image(systemName: "arrow.clockwise")
                 }
-                Text(model.scanning ? "Scanning…" : "Scan Now")
+                Text(model.scanning ? model.scanLabel : "Scan Now")
             }
             .frame(minWidth: 96)
         }
@@ -341,11 +389,16 @@ struct DashboardView: View {
     private var heroTitle: String {
         if !model.isProtected { return "Not protected" }
         if !model.active.isEmpty { return "\(model.active.count) threat\(model.active.count == 1 ? "" : "s") found" }
-        return model.loaded ? "You're protected" : "Starting first scan…"
+        return model.loaded ? "You're protected" : "Loading…"
     }
     private var heroDetail: String {
         if let e = model.lastError { return e }
-        if !model.active.isEmpty { return "Don't open the affected project in VS Code or run npm commands in it. RepoGuard hasn't run any of this code." }
+        if !model.active.isEmpty {
+            let inBranches = model.active.filter { $0.where.hasPrefix("branch:") || $0.where.hasPrefix("incoming:") }.count
+            let onDisk = model.active.count - inBranches
+            if onDisk == 0 { return "All \(inBranches) are inside git branches, not in your files on disk. Use Remove Malware and Fix GitHub to clean those branches." }
+            return "\(onDisk) in your files, \(inBranches) inside git branches. Don't open the affected project in VS Code or run npm commands in it."
+        }
         return "Watching \(model.watchSummary) for suspicious code from GitHub Desktop, VS Code, the terminal and unzipped folders."
     }
 
@@ -367,7 +420,7 @@ struct DashboardView: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: model.scanning ? "hourglass" : "arrow.clockwise")
-                                Text(model.scanning ? "Scanning…" : "Scan Now")
+                                Text(model.scanning ? model.scanLabel : "Scan Now")
                             }
                         }
                         .buttonStyle(HeroButtonStyle())
@@ -377,6 +430,8 @@ struct DashboardView: View {
                 .padding(22)
                 .background(RoundedRectangle(cornerRadius: 16).fill(LinearGradient(colors: heroColors, startPoint: .topLeading, endPoint: .bottomTrailing)))
 
+                ScanProgressBar(model: model)
+
                 HStack(spacing: 12) {
                     StatTile(value: model.isProtected ? "\(model.active.count)" : "Unknown", label: "Active threats", icon: "exclamationmark.triangle.fill", color: !model.isProtected ? cautionOrange : (model.active.isEmpty ? .secondary : dangerRed))
                     StatTile(value: "\(model.repos.count)", label: "Repositories", icon: "folder.fill", color: .accentColor)
@@ -385,11 +440,19 @@ struct DashboardView: View {
                 }
 
                 HStack(alignment: .top, spacing: 12) {
+                    Card { TrendChart(stats: model.daily) }
+                    Card { ProjectChart(findings: model.active) { nav.screen = .threats } }
+                }
+                if !model.active.isEmpty {
+                    if #available(macOS 14, *) { Card { TypeChart(findings: model.active) } }
+                }
+
+                HStack(alignment: .top, spacing: 12) {
                     Card {
                         VStack(alignment: .leading, spacing: 12) {
                             SectionTitle("Repositories") { nav.screen = .repositories }
                             if model.repos.isEmpty {
-                                Text(model.loaded ? "No Git repos in this folder yet." : "Looking for repos…").foregroundColor(.secondary)
+                                Text(model.loaded ? "No Git repos in this folder yet." : "Loading…").foregroundColor(.secondary)
                             }
                             ForEach(model.repos.sorted { $0.threats > $1.threats }.prefix(5)) { r in
                                 HStack(spacing: 9) {
@@ -469,9 +532,25 @@ struct ThreatsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 PageHeader(title: "Threats", subtitle: !model.isProtected ? "RepoGuard can't scan right now, so this list may be out of date." : model.active.isEmpty ? "Nothing needs your attention." : "\(model.active.count) in \(model.threatRepoCount) \(model.threatRepoCount == 1 ? "project" : "projects")") {
                     if !model.active.isEmpty {
-                        Button("Mark All as False Alarm…") { nav.confirmingFalseAlarm = true }.controlSize(.large)
+                        HStack(spacing: 8) {
+                            Button("Mark All as False Alarm…") { nav.confirmingFalseAlarm = true }.controlSize(.large)
+                            Button(model.cleaning ? "Removing…" : "Remove Malware…") { nav.confirmingClean = true }
+                                .buttonStyle(.borderedProminent).tint(dangerRed).controlSize(.large).disabled(model.cleaning || model.scanning)
+                        }
                     }
                 }
+                if model.cleaning {
+                    Card {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Removing malware. Re-fetching clean branches from GitHub can take a few minutes.").foregroundColor(.secondary)
+                        }
+                    }
+                }
+                if let s = model.cleanSummary {
+                    CleanResultCard(summary: s, model: model)
+                }
+                GitHubThreatsSection()
                 if !model.isProtected {
                     EmptyState(icon: "shield.slash.fill", color: cautionOrange, title: "Not protected", detail: model.lastError ?? "The last scan failed.")
                 } else if model.active.isEmpty {
@@ -514,6 +593,14 @@ struct ThreatsView: View {
             }
             .padding(24)
         }
+        .confirmationDialog("Remove malware from \(model.threatRepoCount) \(model.threatRepoCount == 1 ? "project" : "projects")?", isPresented: $nav.confirmingClean, titleVisibility: .visible) {
+            Button("Remove Malware and Fix GitHub") { model.removeMalware(permanent: false, fixGithub: true) }
+            Button("Remove Malware (this Mac only)") { model.removeMalware(permanent: false) }
+            Button("Remove Permanently", role: .destructive) { model.removeMalware(permanent: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only the injected code is cut out; the rest of each file is kept. Files that are entirely malware are deleted. Every original is saved to a backup first. Local branches are cleaned without losing your work.\n\nFix GitHub also cleans branches that are infected on GitHub itself: it pushes one malware-removal commit on top of each one. It's a normal push, not a force-push, so no history is rewritten.\n\nRemove Permanently also deletes infected tags (including evidence and backup tags) and purges the infected commits from git history. That can't be undone.")
+        }
         .alert("Mark \(model.active.count) findings as false alarms?", isPresented: $nav.confirmingFalseAlarm) {
             Button("Cancel", role: .cancel) {}
             Button("Mark as False Alarm", role: .destructive) { model.markAllFalseAlarm() }
@@ -523,9 +610,38 @@ struct ThreatsView: View {
     }
 }
 
+struct CleanResultCard: View {
+    let summary: CleanSummary
+    @ObservedObject var model: AppModel
+    var body: some View {
+        Card {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: summary.manual == 0 ? "checkmark.seal.fill" : "exclamationmark.bubble.fill")
+                    .font(.title2).foregroundColor(summary.manual == 0 ? safeGreen : cautionOrange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Malware removed").font(.headline)
+                    Text("\(summary.files) files cleaned · \(summary.refs) branches fixed" + (summary.purged > 0 ? " · history purged in \(summary.purged) repos" : ""))
+                    if (summary.pushed ?? 0) > 0 { Text("\(summary.pushed ?? 0) GitHub branches fixed with a pushed cleanup commit.").foregroundColor(safeGreen) }
+                    if summary.manual > 0 {
+                        Text("\(summary.manual) need a manual look; RepoGuard left them unchanged:").foregroundColor(cautionOrange)
+                        ForEach(summary.manual_items ?? [], id: \.self) { Text("• " + $0).font(.callout).foregroundColor(.secondary).lineLimit(2) }
+                    }
+                    if summary.kept_tags > 0 { Text("\(summary.kept_tags) infected tags kept. Use Remove Permanently to delete them.").foregroundColor(.secondary) }
+                    if summary.fetch_failed > 0 { Text("\(summary.fetch_failed) repos couldn't reach GitHub; run it again when online.").foregroundColor(.secondary) }
+                    if summary.skipped > 0 { Text("\(summary.skipped) library files skipped (likely false alarms).").foregroundColor(.secondary) }
+                    Text("Originals are backed up in \(summary.backup)").font(.callout).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+                Button("Open Report") { model.openCleanReport() }
+            }
+        }
+    }
+}
+
 struct ThreatRow: View {
     let finding: Finding
     @ObservedObject var model: AppModel
+    @State private var viewing = false
     var body: some View {
         Card {
             HStack(spacing: 12) {
@@ -536,9 +652,10 @@ struct ThreatRow: View {
                     Text(finding.location + (finding.time.map { " · \(niceTime($0))" } ?? "")).font(.callout).foregroundColor(.secondary)
                 }
                 Spacer()
-                Button("Show in Finder") { model.reveal(finding) }
+                Button("View") { viewing = true }
             }
         }
+        .sheet(isPresented: $viewing) { FindingViewer(finding: finding, model: model) }
     }
 }
 
@@ -552,8 +669,9 @@ struct RepositoriesView: View {
                 PageHeader(title: "Repositories", subtitle: "Every Git repo found in \(model.watchSummary)") {
                     ScanButton(model: model)
                 }
+                ScanProgressBar(model: model)
                 if model.repos.isEmpty {
-                    EmptyState(icon: "folder", color: .secondary, title: model.loaded ? "No repositories yet" : "Looking for repos…", detail: "Clone a repo into a watched folder and it appears here automatically.")
+                    EmptyState(icon: "folder", color: .secondary, title: model.loaded ? "No repositories yet" : "Loading…", detail: "Clone a repo into a watched folder and it appears here automatically.")
                 }
                 ForEach(model.repos.sorted { ($0.threats, $1.name) > ($1.threats, $0.name) }) { r in
                     Card {
@@ -599,6 +717,7 @@ struct ActivityDot: View {
         case .review: return cautionOrange
         case .scan: return safeGreen
         case .error: return dangerRed
+        case .fixed: return .accentColor
         }
     }
 }
@@ -699,6 +818,7 @@ struct SettingsView: View {
                     }
                     .toggleStyle(.switch)
                 }
+                GitHubSettingsCard()
                 Card {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("What RepoGuard can't do").font(.headline)
@@ -716,6 +836,224 @@ struct SettingsView: View {
                 Text("RepoGuard 2.0. Scans stay on this Mac and never run the code they read.").font(.callout).foregroundColor(.secondary)
             }
             .padding(24)
+        }
+    }
+}
+
+// MARK: finding viewer: shows the infected lines, from disk or straight from the branch
+
+struct FindingContent {
+    var lines: [(number: Int, text: String, bad: Bool)] = []
+    var note: String?
+    var onDisk = false
+    var error: String?
+}
+
+func loadFindingContent(_ f: Finding) -> FindingContent {
+    var c = FindingContent()
+    var data: Data?
+    let w = f.where
+    if w == "folder" {
+        let p = "\(f.root)/\(f.path)"
+        c.onDisk = FileManager.default.fileExists(atPath: p)
+        data = FileManager.default.contents(atPath: p)
+        if data == nil { c.error = "This file is no longer on disk. Run Scan Now to refresh the list." }
+    } else if w == "git-config" {
+        data = FileManager.default.contents(atPath: "\(f.root)/.git/config")
+        c.note = "From the repo's Git settings (.git/config)."
+    } else {
+        let ref = w.hasPrefix("branch:") ? String(w.dropFirst(7)) : (w.hasPrefix("incoming:") ? String(w.dropFirst(9)) : w)
+        let r = runProcess("/usr/bin/git", ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat",
+                                            "-C", f.root, "show", "\(ref):\(f.path)"], timeout: 30)
+        if r.status == 0 { data = r.out } else { c.error = "This branch or file no longer exists. Run Scan Now to refresh the list." }
+        let short = describeLocation(w).replacingOccurrences(of: "On branch ", with: "")
+        c.note = "This copy is inside the git branch \(short), not in the file you have open on disk. That's why the file on disk can look clean."
+    }
+    guard let d = data else { return c }
+    if d.prefix(8000).contains(0) { c.error = "Binary file (\(d.count) bytes); it can't be shown as text."; return c }
+    let text = String(decoding: d.prefix(2_000_000), as: UTF8.self)
+    var patterns: [NSRegularExpression] = []
+    if let rulesPath = Bundle.main.path(forResource: "rules", ofType: "json"),
+       let rd = FileManager.default.contents(atPath: rulesPath),
+       let rules = try? JSONSerialization.jsonObject(with: rd) as? [String: Any] {
+        for key in ["content_rules", "git_config_rules"] {
+            for rule in (rules[key] as? [[String: Any]]) ?? [] where (rule["id"] as? String) == f.rule || (rule["label"] as? String) == f.label {
+                if let p = rule["pattern"] as? String, let rx = try? NSRegularExpression(pattern: p, options: [.anchorsMatchLines, .caseInsensitive]) { patterns.append(rx) }
+            }
+        }
+    }
+    let offscreen = try! NSRegularExpression(pattern: "\\S[ \\t]{100,}\\S")
+    var hiddenFound = false
+    for (i, raw) in text.components(separatedBy: "\n").enumerated() {
+        let line = raw.replacingOccurrences(of: "\r", with: "")
+        let range = NSRange(line.startIndex..., in: line)
+        var bad = patterns.contains { $0.firstMatch(in: line, range: range) != nil }
+        var shown = line
+        // code pushed far to the right is invisible in an editor; pull it into view
+        if let m = try? NSRegularExpression(pattern: "^(.*?\\S)([ \\t]{100,})(\\S.*)$").firstMatch(in: line, range: range),
+           let a = Range(m.range(at: 1), in: line), let gap = Range(m.range(at: 2), in: line), let b = Range(m.range(at: 3), in: line) {
+            shown = "\(line[a])   ⟶ [\(line[gap].count) spaces hidden] ⟶   \(line[b])"
+            bad = true; hiddenFound = true
+        } else if offscreen.firstMatch(in: line, range: range) != nil { bad = true }
+        if shown.count > 600 { shown = String(shown.prefix(600)) + " … (\(shown.count) characters)" }
+        c.lines.append((i + 1, shown, bad))
+    }
+    if hiddenFound {
+        c.note = (c.note.map { $0 + "\n\n" } ?? "") + "Code was hidden far to the right of a line, so it doesn't show when you open the file. It's pulled into view below."
+    }
+    if !c.lines.contains(where: \.bad) {
+        c.note = (c.note.map { $0 + "\n\n" } ?? "") + "The whole file is flagged by its name or type (\(f.label)), not by one line."
+    }
+    return c
+}
+
+struct FindingViewer: View {
+    let finding: Finding
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var content: FindingContent?
+    @State private var onlyBad = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(finding.label).font(.title3.bold())
+                    Text("\(finding.repoName)/\(finding.path)").font(.system(.callout, design: .monospaced))
+                    Text(finding.location).font(.callout).foregroundColor(.secondary)
+                }
+                Spacer()
+                Toggle("Only flagged lines", isOn: $onlyBad).toggleStyle(.switch).controlSize(.small)
+            }
+            if let c = content {
+                if let n = c.note { Text(n).font(.callout).foregroundColor(cautionOrange).fixedSize(horizontal: false, vertical: true) }
+                if let e = c.error {
+                    Text(e).foregroundColor(.secondary).frame(maxWidth: .infinity, minHeight: 200)
+                } else {
+                    ScrollView([.vertical, .horizontal]) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(c.lines.filter { !onlyBad || $0.bad || !c.lines.contains(where: \.bad) }, id: \.number) { l in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text("\(l.number)").foregroundColor(.secondary).frame(width: 44, alignment: .trailing)
+                                    Text(l.text.isEmpty ? " " : l.text).textSelection(.enabled).fixedSize(horizontal: true, vertical: false)
+                                }
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .padding(.vertical, 1.5).padding(.trailing, 8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(l.bad ? dangerRed.opacity(0.22) : Color.clear)
+                            }
+                        }
+                    }
+                    .frame(minHeight: 260, maxHeight: 420)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 260)
+            }
+            HStack {
+                Text("Viewing is safe: RepoGuard only reads the text and never runs it.").font(.caption).foregroundColor(.secondary)
+                Spacer()
+                if content?.onDisk == true {
+                    Button("Show in Finder") { model.reveal(finding) }
+                        .help("Files starting with a dot are hidden in Finder. Press ⌘⇧. in Finder to show them.")
+                }
+                Button("Close") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 760)
+        .onAppear { DispatchQueue.global().async { let c = loadFindingContent(finding); DispatchQueue.main.async { content = c } } }
+    }
+}
+
+
+// MARK: dashboard charts
+
+struct TrendChart: View {
+    let stats: [DayStat]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Last 14 days").font(.headline)
+                Spacer()
+                Text("\(stats.filter { $0.kind == "Found" }.reduce(0) { $0 + $1.count }) found · \(stats.filter { $0.kind == "Removed" }.reduce(0) { $0 + $1.count }) removed")
+                    .font(.callout).foregroundColor(.secondary)
+            }
+            Chart(stats) { s in
+                BarMark(x: .value("Day", s.day, unit: .day), y: .value("Count", s.count))
+                    .foregroundStyle(by: .value("Kind", s.kind))
+                    .position(by: .value("Kind", s.kind))
+                    .cornerRadius(3)
+            }
+            .chartForegroundStyleScale(["Found": dangerRed, "Removed": safeGreen])
+            .chartXAxis { AxisMarks(values: .stride(by: .day, count: 3)) { _ in AxisValueLabel(format: .dateTime.day().month(.abbreviated)); AxisGridLine() } }
+            .chartLegend(position: .bottom, alignment: .leading)
+            .frame(height: 170)
+        }
+    }
+}
+
+struct ProjectChart: View {
+    let findings: [Finding]
+    let open: () -> Void
+    private var rows: [(String, Int)] {
+        Dictionary(grouping: findings, by: \.repoName).map { ($0.key, $0.value.count) }.sorted { $0.1 > $1.1 }.prefix(6).map { $0 }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Threats by project", action: open)
+            if rows.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "checkmark.seal.fill").font(.system(size: 34)).foregroundColor(safeGreen)
+                    Text("Every project is clean").foregroundColor(.secondary)
+                }.frame(maxWidth: .infinity, minHeight: 170)
+            } else {
+                Chart(rows, id: \.0) { r in
+                    BarMark(x: .value("Threats", r.1), y: .value("Project", r.0), height: .fixed(14))
+                        .foregroundStyle(LinearGradient(colors: [dangerRed.opacity(0.65), dangerRed], startPoint: .leading, endPoint: .trailing))
+                        .cornerRadius(4)
+                        .annotation(position: .trailing) { Text("\(r.1)").font(.caption.bold()).foregroundColor(.secondary) }
+                }
+                .chartXAxis(.hidden)
+                .chartYAxis { AxisMarks(position: .leading) { _ in AxisValueLabel().font(.callout) } }
+                .frame(height: 170)
+            }
+        }
+    }
+}
+
+@available(macOS 14, *)
+struct TypeChart: View {
+    let findings: [Finding]
+    private var rows: [(String, Int)] {
+        Dictionary(grouping: findings, by: \.label).map { ($0.key, $0.value.count) }.sorted { $0.1 > $1.1 }
+    }
+    private let palette: [Color] = [dangerRed, cautionOrange, .purple, .pink, .blue, .teal, .indigo, .brown]
+    var body: some View {
+        HStack(alignment: .center, spacing: 22) {
+            Chart(Array(rows.enumerated()), id: \.element.0) { i, r in
+                SectorMark(angle: .value("Count", r.1), innerRadius: .ratio(0.62), angularInset: 1.5)
+                    .foregroundStyle(palette[i % palette.count])
+                    .cornerRadius(4)
+            }
+            .chartBackground { _ in
+                VStack(spacing: 0) {
+                    Text("\(findings.count)").font(.system(size: 24, weight: .bold))
+                    Text("threats").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .frame(width: 160, height: 160)
+            VStack(alignment: .leading, spacing: 7) {
+                Text("What was found").font(.headline)
+                ForEach(Array(rows.enumerated()), id: \.element.0) { i, r in
+                    HStack(spacing: 8) {
+                        Circle().fill(palette[i % palette.count]).frame(width: 9, height: 9)
+                        Text(r.0).lineLimit(1)
+                        Spacer()
+                        Text("\(r.1)").font(.callout.monospacedDigit()).foregroundColor(.secondary)
+                    }
+                }
+            }
         }
     }
 }
