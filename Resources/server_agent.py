@@ -46,7 +46,7 @@ BAD_CMD = re.compile(
     r"|\.orc\b|fa-brand-400|fa-solid-400\.woff2"          # its payload names
     r"|/dev/shm/|/tmp/\.|/var/tmp/\."                     # hidden files in temp folders
     r"|xmrig|kdevtmpfsi|kinsing|minerd|cpuminer|stratum\+tcp"
-    r"|ethplorer|eth_getTransactionByHash"
+    r"|ethplore[r]|eth_getTransa[c]tionByHash"
     r"|jsonkeeper\.com|npoint\.io", re.I)
 # Weaker signs: shown for review.
 ODD_CMD = re.compile(r"\b(?:nohup|setsid)\b.*\s(?:/tmp|/var/tmp)/|python3?\s+-c\s+['\"].*(?:urllib|socket)|\bnc\s+-e\b|/bin/sh\s+-i", re.I)

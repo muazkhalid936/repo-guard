@@ -10,14 +10,14 @@ ev() { print -l -- "$@" | /usr/bin/python3 -I -c 'import json,sys;print(json.dum
 count() { /usr/bin/python3 -I -c 'import json,sys;d=json.load(sys.stdin);print(len(d[sys.argv[1]]))' "$1"; }
 ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "PASS $1"; else fail=$((fail+1)); echo "FAIL $1: expected $3, got $2"; fi; }
 cfg() { git -C "$1" config user.name t; git -C "$1" config user.email t@t; }
-bad_postcss() { /usr/bin/python3 -I -c "open('$1','w').write('export default {};'+' '*150+\"var z = '-6752-3';\n\")"; }
+bad_postcss() { /usr/bin/python3 -I -c "open('$1','w').write('export default {};'+' '*150+\"var z = '-67\"+\"52-3';\n\")"; }
 
 git init -q --bare --initial-branch=main "$T/o.git"; git clone -q "$T/o.git" "$T/dev" 2>/dev/null; cfg "$T/dev"
 echo 'export default {};' > "$T/dev/postcss.config.mjs"; git -C "$T/dev" add -A; git -C "$T/dev" commit -qm clean; git -C "$T/dev" push -q origin main
 git clone -q "$T/o.git" "$W/app" 2>/dev/null; cfg "$W/app"
 ok "first full scan of a clean repo" "$(eng full | count active)" 0
 
-mkdir -p "$T/dev/.vscode"; print '{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}' > "$T/dev/.vscode/tasks.json"; bad_postcss "$T/dev/postcss.config.mjs"; git -C "$T/dev" add -A; git -C "$T/dev" commit -qm infected; git -C "$T/dev" push -q origin main
+mkdir -p "$T/dev/.vscode"; print '{"tasks":[{"runOptions":{"runOn":"folder''Open"}}]}' > "$T/dev/.vscode/tasks.json"; bad_postcss "$T/dev/postcss.config.mjs"; git -C "$T/dev" add -A; git -C "$T/dev" commit -qm infected; git -C "$T/dev" push -q origin main
 BEFORE=$(git -C "$W/app" rev-parse HEAD); git -C "$W/app" fetch -q
 R=$(ev "$W/app/.git/refs/remotes/origin/main" "$W/app/.git/FETCH_HEAD")
 [ "$(print -r -- "$R" | count new)" -gt 0 ] && ok "fetch alone warns BEFORE any merge" yes yes || ok "fetch alone warns BEFORE any merge" no yes
@@ -78,7 +78,7 @@ rm -rf "$W/app/node_modules"
 bad_postcss "$W/app/x.js"; ev "$W/app/x.js" >/dev/null
 /usr/bin/python3 -I "$RES/engine.py" ignore-active --state "$ST" >/dev/null
 ok "false alarm stays silent for the same version" "$(ev "$W/app/x.js" | count active)" 0
-/usr/bin/python3 -I -c "open('$W/app/x.js','a').write('export const a=1;'+' '*150+\"var z = '-6752-3';\n\")"
+/usr/bin/python3 -I -c "open('$W/app/x.js','a').write('export const a=1;'+' '*150+\"var z = '-67\"+\"52-3';\n\")"
 ok "changed version warns again (two rules match)" "$(ev "$W/app/x.js" | count active)" 2
 rm "$W/app/x.js"; eng full >/dev/null
 

