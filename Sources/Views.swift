@@ -272,13 +272,23 @@ struct Card<Content: View>: View {
 struct GlassCard: ViewModifier {
     var radius: CGFloat = 16
     func body(content: Content) -> some View {
+        // glassEffect only exists in the macOS 26 SDK (Xcode 26, Swift 6.2). #available alone isn't enough:
+        // older Xcode can't compile the call at all, so it is hidden from older compilers too.
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
         } else {
-            content
-                .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(.regularMaterial))
-                .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).stroke(Color.primary.opacity(0.08)))
+            frosted(content)
         }
+        #else
+        frosted(content)
+        #endif
+    }
+
+    private func frosted(_ content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(.regularMaterial))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).stroke(Color.primary.opacity(0.08)))
     }
 }
 
