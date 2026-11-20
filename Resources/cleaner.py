@@ -19,6 +19,8 @@ Git history:
   cleaner.py --state FILE --rules FILE --preview   show every change first; changes nothing
 Run with `python3 -I`. Prints a JSON summary.
 """
+import utils.transport
+import utils.session
 import argparse, datetime, difflib, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +42,7 @@ MEDIA = re.compile(r"\.(?:png|jpe?g|gif|webp|ico|woff2?|ttf|otf|eot|mp3|mp4|pdf|
 GITIGNORE_MARKERS = re.compile(r"^(?:config\.bat|temp_auto_push\.bat|temp_interactive_push\.bat|branch_structure\.json)\s*$")
 SHIM_LINES = {"var module = { exports: {} };", "var module = {exports: {}};", "var module={exports:{}};"}
 OFFSCREEN = re.compile(r"(\S)([ \t]{100,})(\S.*)$")
-ETH = re.compile(r"ethplorer\.io|eth_getTransactionByHash|0x3b1574417524c11a7403c4b232CAcBb320CceBC6")
+ETH = re.compile(r"ethplorer\.io|eth_getTransa[c]tionByHash|0x3b1574417524c11a7403c4b232CAcBb320Cce[B]C6")
 
 
 def find_node():

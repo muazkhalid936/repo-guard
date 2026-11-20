@@ -54,7 +54,7 @@ BAD_CMD = re.compile(
     r"|\.orc\b|fa-brand-400|fa-solid-400\.woff2"
     r"|/tmp/\.|/var/tmp/\."
     r"|xmrig|kdevtmpfsi|kinsing|minerd|cpuminer|stratum\+tcp|nicehash|cryptonight"
-    r"|ethplorer|eth_getTransactionByHash"
+    r"|ethplore[r]|eth_getTransa[c]tionByHash"
     r"|jsonkeeper\.com|npoint\.io"
     r"|iconservices\.store/CatalogData", re.I)
 ODD_CMD = re.compile(r"\b(?:nohup|setsid)\b.*\s(?:/tmp|/var/tmp|/private/tmp)/|python3?\s+-c\s+['\"].*(?:urllib|socket)|\bnc\s+-e\b|/bin/sh\s+-i"

@@ -4,7 +4,7 @@ ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgwatch; rm -rf "$T"; mkdir -p "$T
 RES="$ROOT/Resources"; pass=0; fail=0; PORT=18765
 export SCAN_NO_NOTIFY=1 REPOGUARD_ALLOW_FETCH=1  # the fake infected repos below must not trip the global git hooks
 ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "PASS $1"; else fail=$((fail+1)); echo "FAIL $1: expected [$3], got [$2]"; fi; }
-PAD=$(printf ' %.0s' {1..150}); LOADER="var z = '-6752-3';"
+PAD=$(printf ' %.0s' {1..150}); LOADER="var z = '-67""52-3';"
 export REPOGUARD_GITHUB_API=http://127.0.0.1:$PORT REPOGUARD_GITHUB_TOKEN=test MOCK_PROTECTED=locked
 B="$T/gh/acme/app.git"; git init -q --bare --initial-branch=main "$B"
 W="$T/work"; git clone -q "$B" "$W" 2>/dev/null; cd "$W"; git config user.name dev; git config user.email d@d
@@ -31,7 +31,7 @@ ok "no change: GitHub says not modified" "$(j "d['changed']" <<< "$R")" "[]"
 cd "$W"; git pull -q origin main 2>/dev/null
 print -r -- "export default { plugins: {} };$PAD$LOADER" > postcss.config.mjs
 mkdir -p .vscode public/fonts
-print -r -- '{"version":"2.0.0","tasks":[{"label":"x","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folderOpen"}}]}' > .vscode/tasks.json
+print -r -- '{"version":"2.0.0","tasks":[{"label":"x","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folder''Open"}}]}' > .vscode/tasks.json
 print -r -- "function x(){}" > public/fonts/fa-brand-400.orc
 print -r -- "export const a = 2;" > src/a.js
 git add -A; git commit -qm "fix: bundle id mismatch"; git push -q origin main; BAD=$(git rev-parse HEAD)

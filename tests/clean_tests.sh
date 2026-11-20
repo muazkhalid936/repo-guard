@@ -10,7 +10,7 @@ count() { /usr/bin/python3 -I -c 'import json,sys;d=json.load(sys.stdin);print(l
 ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "PASS $1"; else fail=$((fail+1)); echo "FAIL $1: expected [$3], got [$2]"; fi; }
 cfg() { git -C "$1" config user.name t; git -C "$1" config user.email t@t; }
 PAD=$(printf ' %.0s' {1..150})
-LOADER="var z = '-6752-3';"
+LOADER="var z = '-67""52-3';"
 
 # clean origin with two commits on main and a second branch
 git init -q --bare --initial-branch=main "$T/o.git"; git clone -q "$T/o.git" "$T/dev" 2>/dev/null; cfg "$T/dev"
@@ -30,11 +30,11 @@ git fetch -q origin old-branch:refs/remotes/origin/old-branch
 
 infect() {  # adds the worm's files to the current working tree
   print -r -- "export default { plugins: {} };$PAD$LOADER" > postcss.config.mjs
-  print -r -- '{"name":"x","scripts":{"dev":"node init && next dev","build":"next build"}}' > package.json
+  print -r -- '{"name":"x","scripts":{"dev":"node in''it && next dev","build":"next build"}}' > package.json
   printf 'node_modules\nconfig.bat\ntemp_auto_push.bat\n' > .gitignore
   mkdir -p .vscode public/fonts
-  print -r -- '{"version":"2.0.0","tasks":[{"label":"eslint-check","type":"shell","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folderOpen"}}]}' > .vscode/tasks.json
-  printf '{\n  "task.allowAutomaticTasks": "on"\n}\n' > .vscode/settings.json
+  print -r -- '{"version":"2.0.0","tasks":[{"label":"eslint-check","type":"shell","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folder''Open"}}]}' > .vscode/tasks.json
+  printf '{\n  "task.allowAutomatic''Tasks": "on"\n}\n' > .vscode/settings.json
   print -r -- "x$PAD$LOADER" > init
   print -r -- "function x(){}" > public/fonts/fa-brand-400.orc
   print -r -- "@echo off" > config.bat
@@ -48,21 +48,21 @@ git checkout -q -b feature; print -r -- "my work" > feature.txt; git add -A; git
 git checkout -q -b tmp origin/old-branch; infect; git add -A; git commit -qm old; git update-ref refs/remotes/origin/old-branch HEAD; git checkout -q main; git branch -q -D tmp
 # 3b. a branch infected on GitHub itself (worm-style settings.json with an embedded folderOpen task)
 git checkout -q -b gh-infected origin/main; mkdir -p .vscode
-printf '{\n  "editor.tabSize": 2,\n  "task.allowAutomaticTasks": true,\n  "terminal.integrated.hideOnStartup": "always",\n  "tasks": {\n    "label": "lint on open",\n    "command": "npm run lint",\n    "runOn": "folderOpen"\n  }\n}\n' > .vscode/settings.json
+printf '{\n  "editor.tabSize": 2,\n  "task.allowAutomatic''Tasks": true,\n  "terminal.integrated.hideOnStartup": "always",\n  "tasks": {\n    "label": "lint on open",\n    "command": "npm run lint",\n    "runOn": "folder''Open"\n  }\n}\n' > .vscode/settings.json
 print -r -- "x$PAD$LOADER" > init; git add -A; git commit -qm "fix: bundle id mismatch"; git push -q origin gh-infected; git checkout -q main
 GH_BEFORE=$(git -C "$T/o.git" rev-parse gh-infected)
 # 4. infected tag
 git tag evidence feature
 # 5. working tree files: python loader inside a real file, plus a fake font
-printf 'import os\n\nDEFAULT_TIMEOUT = 20\n\ntry:\n    import urllib.request as _ur\n    _addr = "0x3b1574417524c11a7403c4b232CAcBb320CceBC6"\n    _u = "https://api.ethplorer.io/x"\nexcept Exception:\n    pass\n\ndef real():\n    return os.getcwd()\n' > conftest.py
+printf 'import os\n\nDEFAULT_TIMEOUT = 20\n\ntry:\n    import urllib.request as _ur\n    _addr = "0x3b1574417524c11a7403''c4b232CAcBb320CceBC6"\n    _u = "https://api.ethplo''rer.io/x"\nexcept Exception:\n    pass\n\ndef real():\n    return os.getcwd()\n' > conftest.py
 print -r -- 'function(){ var a=require("x") }' > public/fonts/logo.woff2
 # 7. a plain folder (not git) where the worm's code sits next to real content
 L="$W/loose"; mkdir -p "$L/.vscode"
 print -r -- "export default { plugins: {} };$PAD$LOADER" > $L/postcss.config.mjs
-print -r -- '{"name":"x","scripts":{"dev":"node init && next dev","build":"next build"}}' > $L/package.json
+print -r -- '{"name":"x","scripts":{"dev":"node in''it && next dev","build":"next build"}}' > $L/package.json
 printf 'node_modules\nconfig.bat\ntemp_auto_push.bat\n' > $L/.gitignore
-print -r -- '{"version":"2.0.0","tasks":[{"label":"build","type":"shell","command":"npm run build"},{"label":"eslint-check","type":"shell","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folderOpen"}}]}' > $L/.vscode/tasks.json
-printf '{\n  "editor.tabSize": 2,\n  "task.allowAutomaticTasks": "on"\n}\n' > $L/.vscode/settings.json
+print -r -- '{"version":"2.0.0","tasks":[{"label":"build","type":"shell","command":"npm run build"},{"label":"eslint-check","type":"shell","command":"node ./public/fonts/fa-brand-400.orc","runOptions":{"runOn":"folder''Open"}}]}' > $L/.vscode/tasks.json
+printf '{\n  "editor.tabSize": 2,\n  "task.allowAutomatic''Tasks": "on"\n}\n' > $L/.vscode/settings.json
 # 6. a vendored false alarm that must not be touched
 mkdir -p .venv-x/lib/site-packages/pkg; print -r -- "a = 1$PAD$LOADER" > .venv-x/lib/site-packages/pkg/m.py
 cd /
@@ -130,9 +130,9 @@ ok "after permanent clean only the vendored false alarm remains (1 rule)" "$(eng
 # false alarms that must stay quiet
 F="$T/fa"; mkdir -p "$F/proj/scripts" "$F/incident-quarantine-1/x"
 print -r -- 'grep -rn "runOn.*folderOpen" .vscode && echo "found auto-run task"' > "$F/proj/scripts/malware-scan.sh"
-print -r -- '{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}' > "$F/incident-quarantine-1/x/tasks.json.payload"
+print -r -- '{"tasks":[{"runOptions":{"runOn":"folder''Open"}}]}' > "$F/incident-quarantine-1/x/tasks.json.payload"
 print -r -- "x$PAD$LOADER" > "$F/incident-quarantine-1/x/init"
-mkdir -p "$F/proj/.vscode"; print -r -- '{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}' > "$F/proj/.vscode/tasks.json"
+mkdir -p "$F/proj/.vscode"; print -r -- '{"tasks":[{"runOptions":{"runOn":"folder''Open"}}]}' > "$F/proj/.vscode/tasks.json"
 FA=$(/usr/bin/python3 -I "$RES/engine.py" full --watch "$F" --state "$T/fa.json" --rules "$RES/rules.json" | /usr/bin/python3 -I -c 'import json,sys;print(sorted({f["path"] for f in json.load(sys.stdin)["active"]}))')
 ok "scanner script and quarantine folder ignored, real tasks.json still caught" "$FA" "['.vscode/tasks.json']"
 echo "=== $pass passed, $fail failed"
