@@ -16,6 +16,17 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/engine.py Resources/cleaner.py Resources/server_agent.py Resources/github_watch.py Resources/mac_agent.py Resources/storage.py Resources/rules.json "$APP/Contents/Resources/"
 codesign --force --deep --sign - "$APP"
 echo "built $APP"
+if [ "$1" = "dmg" ]; then
+  # Disk image with the app and an Applications shortcut to drag it onto.
+  VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
+  STAGE=build/tmp/dmg; DMG=build/release/RepoGuard-$VER.dmg
+  rm -rf "$STAGE" "$DMG"; mkdir -p "$STAGE" build/release
+  ditto "$APP" "$STAGE/RepoGuard.app"
+  ln -s /Applications "$STAGE/Applications"
+  hdiutil create -quiet -volname "RepoGuard $VER" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
+  rm -rf "$STAGE"
+  echo "built $DMG"
+fi
 if [ "$1" = "install" ]; then
   mkdir -p "$HOME/Applications"
   ditto "$APP" "$HOME/Applications/RepoGuard.app"
