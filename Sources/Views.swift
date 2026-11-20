@@ -22,7 +22,6 @@ enum Screen: String, CaseIterable, Identifiable {
 final class Navigation: ObservableObject {
     @Published var screen: Screen? = .dashboard
     @Published var confirmingFalseAlarm = false
-    @Published var confirmingClean = false
     @Published var activityFilter = 0
 }
 
@@ -538,8 +537,8 @@ struct ThreatsView: View {
                     if !model.active.isEmpty {
                         HStack(spacing: 8) {
                             Button("Mark All as False Alarm…") { nav.confirmingFalseAlarm = true }.controlSize(.large)
-                            Button(model.cleaning ? "Removing…" : "Remove Malware…") { nav.confirmingClean = true }
-                                .buttonStyle(.borderedProminent).tint(dangerRed).controlSize(.large).disabled(model.cleaning || model.scanning)
+                            Button(model.cleaning ? "Removing…" : model.previewing ? "Preparing review…" : "Review & Remove Malware…") { model.previewClean() }
+                                .buttonStyle(.borderedProminent).tint(dangerRed).controlSize(.large).disabled(model.cleaning || model.scanning || model.previewing)
                         }
                     }
                 }
@@ -597,14 +596,7 @@ struct ThreatsView: View {
             }
             .padding(24)
         }
-        .confirmationDialog("Remove malware from \(model.threatRepoCount) \(model.threatRepoCount == 1 ? "project" : "projects")?", isPresented: $nav.confirmingClean, titleVisibility: .visible) {
-            Button("Remove Malware and Fix GitHub") { model.removeMalware(permanent: false, fixGithub: true) }
-            Button("Remove Malware (this Mac only)") { model.removeMalware(permanent: false) }
-            Button("Remove Permanently", role: .destructive) { model.removeMalware(permanent: true) }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Only the injected code is cut out; the rest of each file is kept. Files that are entirely malware are deleted. Every original is saved to a backup first. Local branches are cleaned without losing your work.\n\nFix GitHub also cleans branches that are infected on GitHub itself: it pushes one malware-removal commit on top of each one. It's a normal push, not a force-push, so no history is rewritten.\n\nRemove Permanently also deletes infected tags (including evidence and backup tags) and purges the infected commits from git history. That can't be undone.")
-        }
+        .sheet(item: $model.cleanPlan) { CleanPreviewSheet(plan: $0, model: model) }
         .alert("Mark \(model.active.count) findings as false alarms?", isPresented: $nav.confirmingFalseAlarm) {
             Button("Cancel", role: .cancel) {}
             Button("Mark as False Alarm", role: .destructive) { model.markAllFalseAlarm() }

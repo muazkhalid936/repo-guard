@@ -15,10 +15,11 @@ Git history:
     otherwise a cleanup commit is added on top so no work is lost.
   * --permanent: also deletes infected tags and purges the unreachable infected commits.
 
-  cleaner.py --state FILE --rules FILE --backup DIR --log FILE [--permanent]
+  cleaner.py --state FILE --rules FILE --backup DIR --log FILE [--permanent] [--expect FINGERPRINT]
+  cleaner.py --state FILE --rules FILE --preview   show every change first; changes nothing
 Run with `python3 -I`. Prints a JSON summary.
 """
-import argparse, datetime, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
+import argparse, datetime, difflib, hashlib, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("rg_engine", os.path.join(HERE, "engine.py"))
@@ -266,6 +267,115 @@ def syntax_check(path, text, orig=None):
                     return
             err = next((l.strip() for l in r.stderr.splitlines() if "Error" in l), r.stderr.strip()[:120])
             raise Manual(f"cleaned JavaScript would not parse ({err[:140]})")
+
+
+# ---------------------------------------------------------------- preview
+
+def _show(line, limit=240):
+    """One line made readable: control characters replaced, long blank runs named, long lines cut."""
+    line = "".join(c if c >= " " or c == "\t" else "\ufffd" for c in line)
+    line = re.sub(r"[ \t]{20,}", lambda m: f"\u27e8{len(m.group(0))} blank characters\u27e9", line)
+    return line if len(line) <= limit else line[:limit] + f" \u2026 (+{len(line) - limit:,} more characters)"
+
+
+def describe(path, old, new, notes, max_lines=14):
+    """What cleaning does to one file, shown to the person before anything changes."""
+    text = old.decode("utf-8", "replace").replace("\r\n", "\n")
+    ol = text.split("\n")
+    if new is None:
+        removed, kept, cut = [l for l in ol], [], len(text)
+        while removed and not removed[-1].strip():
+            removed.pop()
+    else:
+        ntext = new.decode("utf-8", "replace").replace("\r\n", "\n")
+        nl = ntext.split("\n")
+        removed, kept = [], []
+        sm = difflib.SequenceMatcher(None, ol, nl, autojunk=len(ol) > 5000)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag != "equal":
+                removed += ol[i1:i2]
+                kept += nl[j1:j2]
+        cut = max(0, len(text) - len(ntext))
+    return {"path": path, "action": "delete" if new is None else "clean", "notes": list(dict.fromkeys(notes)),
+            "removed": [_show(l) for l in removed[:max_lines]], "more_removed": max(0, len(removed) - max_lines),
+            "kept": [_show(l) for l in kept[:max_lines]], "more_kept": max(0, len(kept) - max_lines),
+            "removed_chars": cut}
+
+
+def plan_item(repo, path, data, hits, where):
+    """describe() for one infected file version, or why it needs a person."""
+    try:
+        new, notes = clean_text(path, data, hits)
+        item = describe(path, data, new, notes)
+    except Manual as e:
+        item = {"path": path, "action": "manual", "why": str(e), "notes": [], "removed": [], "kept": [],
+                "more_removed": 0, "more_kept": 0, "removed_chars": 0}
+    item.update(repo=repo, where=[where], found=sorted({h[2] for h in hits}))
+    return item
+
+
+def fingerprint(findings):
+    """Ties an approval to the threats that were shown; the real run refuses if they changed."""
+    return hashlib.sha256("\n".join(sorted(findings)).encode()).hexdigest()[:16]
+
+
+def ref_label(ref):
+    if ref.startswith("refs/remotes/"):
+        return "GitHub copy " + ref[len("refs/remotes/"):]
+    if ref.startswith("refs/heads/"):
+        return "branch " + ref[len("refs/heads/"):]
+    return "tag " + ref[len("refs/tags/"):]
+
+
+def build_plan(disk, repos, report):
+    """Everything Remove Malware would do, worked out without changing anything (no fetch either)."""
+    items, refs = {}, []
+
+    def add(repo, path, data, hits, where):
+        key = (repo, path, hashlib.sha1(data).hexdigest())
+        if key in items:
+            if where not in items[key]["where"]:
+                items[key]["where"].append(where)
+        else:
+            items[key] = plan_item(repo, path, data, hits, where)
+
+    for repo in sorted(repos):
+        if not os.path.isdir(os.path.join(repo, ".git")):
+            continue
+        current = head_branch(repo)
+        for ref in all_refs(repo):
+            sha = rev(repo, ref)
+            hits = tree_hits(repo, sha) if sha else None
+            if not hits:
+                continue
+            for p, h in hits.items():
+                data = blob_at(repo, sha, p)
+                if data is not None:
+                    add(repo, p, data, h, ref_label(ref))
+            r = {"repo": repo, "ref": ref_label(ref), "files": sorted(hits)}
+            if ref.startswith("refs/remotes/"):
+                r["kind"] = "github"
+            elif ref.startswith("refs/heads/"):
+                r["kind"] = "branch"
+                r["checked_out"] = current == ref
+                up = rev(repo, "refs/remotes/origin/" + ref[len("refs/heads/"):])
+                r["plan"] = ("move" if up and not tree_hits(repo, up) and only_malware_differs(repo, sha, up, hits)
+                             else "commit")
+            else:
+                r["kind"] = "tag"
+            refs.append(r)
+    for (root, rel), hits in sorted(disk.items()):
+        if VENDORED.search("/" + rel):
+            report["skipped"].append({"path": f"{root}/{rel}", "why": "inside a library folder; most likely a false alarm"})
+            continue
+        try:
+            data = open(os.path.join(root, rel), "rb").read()
+        except OSError:
+            continue
+        h = [x for x in RULES.check(rel, data) if x[1] == "block"]
+        if h:
+            add(root, rel, data, h, "files on disk")
+    return sorted(items.values(), key=lambda i: (i["repo"], i["path"])), refs
 
 
 # ---------------------------------------------------------------- backups
@@ -584,20 +694,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--state", required=True)
     ap.add_argument("--rules", required=True)
-    ap.add_argument("--backup", required=True)
+    ap.add_argument("--backup", default="")
     ap.add_argument("--log", default="")
     ap.add_argument("--permanent", action="store_true")
     ap.add_argument("--fix-github", action="store_true", help="also fix infected GitHub branches with a pushed cleanup commit")
+    ap.add_argument("--preview", action="store_true", help="print every planned change as JSON; change nothing")
+    ap.add_argument("--expect", default="", help="fingerprint from --preview; refuse to run if the threats changed")
     a = ap.parse_args()
+    if not a.preview and not a.backup:
+        ap.error("--backup is required")
     RULES = engine.Rules(a.rules)
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     BACKUP = os.path.join(a.backup, stamp)
-    TMPDIR = os.path.join(a.backup, ".tmp")
+    TMPDIR = os.path.join(a.backup, ".tmp") if a.backup else tempfile.mkdtemp(prefix="rg-preview-")
     os.makedirs(TMPDIR, exist_ok=True)
     report = {"files": [], "refs": [], "fetched": [], "manual": [], "skipped": [], "kept_tags": [], "purged": [], "pushed": [],
               "backup": BACKUP, "permanent": a.permanent}
 
-    findings = list(json.load(open(a.state)).get("findings", {}).values())
+    saved = json.load(open(a.state)).get("findings", {})
+    findings = list(saved.values())
+    fp = fingerprint(saved)
+    if a.expect and a.expect != fp:
+        shutil.rmtree(TMPDIR, ignore_errors=True)
+        print(json.dumps({"error": "changed", "fingerprint": fp}))
+        sys.exit(3)
     disk, repos = {}, set()
     for f in findings:
         w = f["where"]
@@ -608,6 +728,13 @@ def main():
         # git-config findings are left for a person to look at
         elif w == "git-config":
             report["manual"].append({"path": f"{f['root']}/{f['path']}", "why": "git setting that can run a program; check it by hand"})
+
+    if a.preview:
+        items, refs = build_plan(disk, repos, report)
+        shutil.rmtree(TMPDIR, ignore_errors=True)
+        print(json.dumps({"fingerprint": fp, "items": items, "refs": refs, "manual": report["manual"],
+                          "skipped": report["skipped"]}))
+        return
 
     # Branches first: moving a checked-out branch to its clean version also fixes its files.
     for repo in sorted(repos):

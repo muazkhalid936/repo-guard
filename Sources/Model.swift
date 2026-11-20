@@ -146,6 +146,8 @@ final class AppModel: ObservableObject {
     @Published var loaded = false
     @Published var cleaning = false
     @Published var cleanSummary: CleanSummary?
+    @Published var cleanPlan: CleanPlan?
+    @Published var previewing = false
     @Published var watchDirs: [String]
     @Published var setupDone: Bool
     @Published var launchAtLogin = FileManager.default.fileExists(atPath: agentPath)
@@ -297,12 +299,43 @@ final class AppModel: ObservableObject {
 
     func scanNow() { run(mode: "full", paths: nil) }
 
+    /// Works out every change Remove Malware would make, without changing anything, for the review sheet.
+    func previewClean() {
+        guard !previewing else { return }
+        previewing = true
+        scanQueue.async { [weak self] in
+            guard let self = self else { return }
+            let res: Result<CleanPlan, Error>
+            if let cleaner = Bundle.main.path(forResource: "cleaner", ofType: "py"),
+               let rules = Bundle.main.path(forResource: "rules", ofType: "json") {
+                let r = runProcess("/usr/bin/python3", ["-I", cleaner, "--state", "\(supportDir)/state.json", "--rules", rules, "--preview"], timeout: 600)
+                if r.status == 0, let plan = try? JSONDecoder().decode(CleanPlan.self, from: r.out) {
+                    res = .success(plan)
+                } else {
+                    self.appendLog("CLEANER PREVIEW ERROR: \(r.errText.suffix(400))")
+                    res = .failure(NSError(domain: "RepoGuard", code: 5, userInfo: [NSLocalizedDescriptionKey: "Couldn't prepare the review. See Activity for details."]))
+                }
+            } else {
+                res = .failure(NSError(domain: "RepoGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: "The cleaner is missing. Reinstall RepoGuard."]))
+            }
+            DispatchQueue.main.async {
+                self.previewing = false
+                switch res {
+                case .success(let p): self.cleanPlan = p
+                case .failure(let e): self.lastError = e.localizedDescription
+                }
+                self.onChange?()
+            }
+        }
+    }
+
     /// Cuts the malware out of files and git history, backs up every original, then rescans.
-    func removeMalware(permanent: Bool, fixGithub: Bool = false) {
+    /// `expect` is the reviewed plan's fingerprint: if the threats changed since, nothing runs.
+    func removeMalware(permanent: Bool, fixGithub: Bool = false, expect: String = "") {
         scanQueue.async { [weak self] in
             guard let self = self else { return }
             DispatchQueue.main.async { self.cleaning = true; self.cleanSummary = nil; self.onChange?() }
-            let summary = self.runCleaner(permanent: permanent, fixGithub: fixGithub)
+            let summary = self.runCleaner(permanent: permanent, fixGithub: fixGithub, expect: expect)
             DispatchQueue.main.async {
                 self.cleaning = false
                 switch summary {
@@ -319,7 +352,7 @@ final class AppModel: ObservableObject {
 
     func openCleanReport() { NSWorkspace.shared.open(URL(fileURLWithPath: cleanReportPath)) }
 
-    private func runCleaner(permanent: Bool, fixGithub: Bool) -> Result<CleanSummary, Error> {
+    private func runCleaner(permanent: Bool, fixGithub: Bool, expect: String) -> Result<CleanSummary, Error> {
         guard let cleaner = Bundle.main.path(forResource: "cleaner", ofType: "py"),
               let rules = Bundle.main.path(forResource: "rules", ofType: "json") else {
             return .failure(NSError(domain: "RepoGuard", code: 3, userInfo: [NSLocalizedDescriptionKey: "The cleaner is missing. Reinstall RepoGuard."]))
@@ -329,6 +362,7 @@ final class AppModel: ObservableObject {
         var args = ["-I", cleaner, "--state", "\(supportDir)/state.json", "--rules", rules, "--backup", backup, "--log", logFile]
         if permanent { args.append("--permanent") }
         if fixGithub { args.append("--fix-github") }
+        if !expect.isEmpty { args += ["--expect", expect] }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = args
@@ -344,6 +378,9 @@ final class AppModel: ObservableObject {
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         group.wait()
+        if p.terminationStatus == 3 {
+            return .failure(NSError(domain: "RepoGuard", code: 6, userInfo: [NSLocalizedDescriptionKey: "The threats changed after you reviewed them, so nothing was removed. Click Review & Remove Malware again to see the new list."]))
+        }
         if p.terminationStatus != 0 {
             appendLog("CLEANER ERROR: \(String(data: errData, encoding: .utf8) ?? "")")
             return .failure(NSError(domain: "RepoGuard", code: 4, userInfo: [NSLocalizedDescriptionKey: "Removing malware failed. See Activity for details."]))
@@ -460,7 +497,7 @@ final class AppModel: ObservableObject {
         do { return .success(try JSONDecoder().decode(ScanResult.self, from: data)) } catch { return .failure(error) }
     }
 
-    private func appendLog(_ text: String) {
+    func appendLog(_ text: String) {
         guard let h = FileHandle(forWritingAtPath: logFile) else {
             FileManager.default.createFile(atPath: logFile, contents: text.data(using: .utf8))
             return

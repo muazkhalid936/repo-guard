@@ -373,8 +373,11 @@ def analyze(a):
             continue
         items.append(dict(id=item_id("sim", s["udid"]), category="Simulators",
                           title=s["name"] + (" (unavailable)" if s["unavailable"] else ""), path=s["path"], size=size,
-                          detail="Simulator for an iOS version Xcode no longer has." if s["unavailable"] else "Apps and data inside this simulator. It's recreated empty if you use it again.",
-                          selected=s["unavailable"], kind="simulator", udid=s["udid"]))
+                          detail=("Xcode doesn't have this simulator's iOS version right now (it can come back after Xcode downloads it). Deleting removes its apps and data."
+                                  if s["unavailable"] else "Apps and data inside this simulator. Deleting removes them for good."),
+                          # Never pre-selected: simulators hold the person's apps and data, and after an Xcode reinstall
+                          # every simulator reads as unavailable, which used to tick all of them.
+                          selected=False, kind="simulator", udid=s["udid"]))
 
     progress("Checking Android SDK")
     images, avd = android_items()

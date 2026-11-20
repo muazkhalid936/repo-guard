@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP=build/RepoGuard.app
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build/tmp
 swiftc -O -swift-version 5 -target arm64-apple-macos13 -framework AppKit -framework SwiftUI -framework Charts -framework CoreServices \
-  Sources/main.swift Sources/Model.swift Sources/Views.swift Sources/Servers.swift Sources/GitHubWatch.swift Sources/MacScan.swift Sources/Storage.swift Sources/DiskMap.swift -o "$APP/Contents/MacOS/RepoGuard"
+  Sources/main.swift Sources/Model.swift Sources/Views.swift Sources/Servers.swift Sources/GitHubWatch.swift Sources/MacScan.swift Sources/Storage.swift Sources/DiskMap.swift Sources/CleanPreview.swift -o "$APP/Contents/MacOS/RepoGuard"
 if [ ! -f build/tmp/AppIcon.icns ] || [ tools/make_icon.swift -nt build/tmp/AppIcon.icns ]; then
   swiftc -swift-version 5 -framework AppKit tools/make_icon.swift -o build/tmp/make_icon
   build/tmp/make_icon build/tmp/AppIcon.iconset

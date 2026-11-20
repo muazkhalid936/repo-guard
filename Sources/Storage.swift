@@ -481,12 +481,7 @@ struct CleanupView: View {
             }
             .padding(24)
         }
-        .alert("Clean \(bytes(store.selectedSize))?", isPresented: $confirmClean) {
-            Button("Clean", role: .destructive) { store.clean() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The selected caches, simulators and build folders are deleted for good. Tools download or rebuild them when needed. Files from Downloads go to the Trash.")
-        }
+        .sheet(isPresented: $confirmClean) { CleanReviewSheet(store: store) }
         .sheet(item: $archiveTarget) { p in ArchiveSheet(project: p, store: store) }
     }
 
@@ -511,7 +506,7 @@ struct CleanupView: View {
                     Text("Safe to clean").font(.headline)
                     Spacer()
                     Text("\(bytes(store.selectedSize)) selected of \(bytes(store.reclaimable))").foregroundColor(.secondary).font(.callout)
-                    Button { confirmClean = true } label: { Label("Clean Selected", systemImage: "sparkles") }
+                    Button { confirmClean = true } label: { Label("Review & Clean…", systemImage: "sparkles") }
                         .buttonStyle(.borderedProminent).disabled(store.selected.isEmpty || store.cleaning || store.analyzing)
                 }
                 ForEach(store.categories, id: \.self) { cat in
@@ -880,5 +875,102 @@ struct ArchiveSheet: View {
         }
         .padding(24)
         .frame(width: 560)
+    }
+}
+
+/// Shown before anything is deleted: every selected item with its path, grouped by category, each with
+/// its own checkbox. Items that hold the person's own data (simulators, runtimes, archives, Downloads,
+/// emulators) are marked, so nothing like that goes without being seen.
+struct CleanReviewSheet: View {
+    @ObservedObject var store: StorageStore
+    @Environment(\.dismiss) private var dismiss
+    /// The rows stay listed after being unticked, so a mis-click can be undone.
+    @State private var listed: [CleanItem] = []
+
+    static func holdsData(_ it: CleanItem) -> Bool {
+        ["simulator", "runtime", "trash", "avd", "backupfile"].contains(it.kind) || it.id == "xcode-archives" || it.category == "Old projects"
+    }
+
+    private var chosen: [CleanItem] { listed.filter { store.selected.contains($0.id) } }
+    private var chosenSize: Int64 { chosen.reduce(0) { $0 + $1.size } }
+    private var cats: [String] { store.categories.filter { c in listed.contains { $0.category == c } } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(cautionOrange.opacity(0.15)).frame(width: 44, height: 44)
+                    Image(systemName: "trash.fill").foregroundColor(cautionOrange).font(.title3)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review what will be deleted").font(.title3.bold())
+                    Text("Untick anything you want to keep. Caches and build folders are rebuilt when needed; items marked “your data” are gone for good. Files from Downloads go to the Trash.")
+                        .font(.callout).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 10) {
+                Button("Select All") { store.selected.formUnion(listed.map(\.id)) }
+                Button("Only Caches") {
+                    store.selected.subtract(listed.filter(Self.holdsData).map(\.id))
+                }.help("Untick simulators, runtimes, archives, Downloads and other items that hold your data")
+                Button("Select None") { store.selected.subtract(listed.map(\.id)) }
+                Spacer()
+                let dataCount = chosen.filter(Self.holdsData).count
+                if dataCount > 0 { Pill(text: "\(dataCount) with your data", color: cautionOrange) }
+            }.controlSize(.small)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(cats, id: \.self) { cat in
+                        let its = listed.filter { $0.category == cat }
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Circle().fill(categoryColor(cat)).frame(width: 9, height: 9)
+                                Text(cat).font(.headline)
+                                Spacer()
+                                Text(bytes(its.filter { store.selected.contains($0.id) }.reduce(0) { $0 + $1.size })).font(.callout.monospacedDigit()).foregroundColor(.secondary)
+                            }
+                            ForEach(its) { it in row(it) }
+                        }
+                        if cat != cats.last { Divider() }
+                    }
+                }.padding(.trailing, 8)
+            }
+            .frame(minHeight: 260, maxHeight: 440)
+            HStack {
+                Text("\(chosen.count) of \(listed.count) items · \(bytes(chosenSize))").foregroundColor(.secondary).font(.callout)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(role: .destructive) { store.clean(); dismiss() } label: {
+                    Text(chosen.isEmpty ? "Delete" : "Delete \(chosen.count) item\(chosen.count == 1 ? "" : "s") (\(bytes(chosenSize)))")
+                }
+                .buttonStyle(.borderedProminent).tint(dangerRed).disabled(chosen.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 640)
+        .onAppear { listed = store.items.filter { store.selected.contains($0.id) }.sorted { $0.size > $1.size } }
+    }
+
+    private func row(_ it: CleanItem) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Toggle("", isOn: Binding(get: { store.selected.contains(it.id) },
+                                     set: { on in if on { store.selected.insert(it.id) } else { store.selected.remove(it.id) } }))
+                .labelsHidden().toggleStyle(.checkbox)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(it.title).lineLimit(1)
+                    if Self.holdsData(it) { Pill(text: "your data", color: cautionOrange) }
+                }
+                if !it.path.isEmpty {
+                    Text(it.path.replacingOccurrences(of: NSHomeDirectory(), with: "~")).font(.caption.monospaced()).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                }
+                Text(it.detail).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Text(bytes(it.size)).font(.callout.monospacedDigit()).foregroundColor(.secondary)
+        }
+        .padding(.leading, 17)
+        .opacity(store.selected.contains(it.id) ? 1 : 0.55)
     }
 }

@@ -3,7 +3,7 @@
 # Usage: tests/clean_tests.sh SCRATCH_DIR
 ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgclean; rm -rf "$T"; mkdir -p "$T"
 RES="$ROOT/Resources"; W="$T/watch"; mkdir -p "$W"; ST="$T/state.json"; BK="$T/backup"; pass=0; fail=0
-export SCAN_NO_NOTIFY=1
+export SCAN_NO_NOTIFY=1 REPOGUARD_ALLOW_FETCH=1  # the fake infected repos below must not trip the global git hooks
 eng() { /usr/bin/python3 -I "$RES/engine.py" full --watch "$W" --state "$ST" --rules "$RES/rules.json" --log "$T/log"; }
 cln() { /usr/bin/python3 -I "$RES/cleaner.py" --state "$ST" --rules "$RES/rules.json" --backup "$BK" --log "$T/log" "$@"; }
 count() { /usr/bin/python3 -I -c 'import json,sys;d=json.load(sys.stdin);print(len(d[sys.argv[1]]))' "$1"; }
@@ -71,7 +71,23 @@ BEFORE=$(eng | count active)
 [ "$BEFORE" -gt 10 ] && ok "fake infection is detected ($BEFORE findings)" yes yes || ok "fake infection is detected" "$BEFORE" ">10"
 FEATURE_BEFORE=$(git -C "$W/app" rev-parse feature)
 
-S=$(cln --fix-github); print -r -- "$S"; cp "$BK/last-clean.json" "$T/first.json"
+# Preview: shows every change, changes nothing
+snap() { (cd "$W" && find . -type f -not -path '*/.git/*' -exec shasum {} + | sort; git -C "$W/app" for-each-ref; git -C "$T/o.git" for-each-ref) | shasum; }
+SNAP=$(snap)
+P=$(/usr/bin/python3 -I "$RES/cleaner.py" --state "$ST" --rules "$RES/rules.json" --preview); print -r -- "$P" > "$T/preview.json"
+pj() { /usr/bin/python3 -I -c "import json,sys;d=json.load(open(sys.argv[2]));print(eval(sys.argv[1]))" "$1" "$T/preview.json"; }
+ok "preview changes nothing" "$(snap)" "$SNAP"
+ok "preview: postcss cut shown, real code kept" "$(pj "[(i['action'], i['kept']) for i in d['items'] if i['path']=='postcss.config.mjs' and i['repo'].endswith('loose')]")" "[('clean', ['export default { plugins: {} };'])]"
+ok "preview: hidden code is made visible" "$(pj "any('150 blank characters' in l for i in d['items'] if i['path']=='postcss.config.mjs' for l in i['removed'])")" True
+ok "preview: init will be deleted" "$(pj "sorted({i['action'] for i in d['items'] if i['path']=='init'})")" "['delete']"
+ok "preview: one entry per file version, listing every place" "$(pj "len([i for i in d['items'] if i['path']=='init' and 'files on disk' in i['where'] and 'branch main' in i['where']])")" 1
+ok "preview: branch with real work gets a cleanup commit" "$(pj "[r['plan'] for r in d['refs'] if r['ref']=='branch feature']")" "['commit']"
+ok "preview: GitHub copies listed" "$(pj "sorted(r['ref'] for r in d['refs'] if r['kind']=='github')")" "['GitHub copy origin/gh-infected', 'GitHub copy origin/old-branch']"
+FP=$(pj "d['fingerprint']")
+cln --fix-github --expect 0000000000000000 >/dev/null; ok "approval for other threats is refused" "$?" 3
+ok "refused run changes nothing" "$(snap)" "$SNAP"
+
+S=$(cln --fix-github --expect "$FP"); print -r -- "$S"; cp "$BK/last-clean.json" "$T/first.json"
 A="$W/app"
 ok "postcss: hidden code cut, real code kept" "$(cat $L/postcss.config.mjs)" "export default { plugins: {} };"
 ok "package.json: node init removed, scripts kept" "$(cat $L/package.json)" '{"name":"x","scripts":{"dev":"next dev","build":"next build"}}'

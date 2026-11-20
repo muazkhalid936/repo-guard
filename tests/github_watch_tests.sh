@@ -2,7 +2,7 @@
 # Tests for the GitHub watch against a local fake GitHub. Usage: tests/github_watch_tests.sh SCRATCH_DIR
 ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgwatch; rm -rf "$T"; mkdir -p "$T/gh/acme"
 RES="$ROOT/Resources"; pass=0; fail=0; PORT=18765
-export SCAN_NO_NOTIFY=1  # the fake infected repos below would trip the global git scan hook's popup
+export SCAN_NO_NOTIFY=1 REPOGUARD_ALLOW_FETCH=1  # the fake infected repos below must not trip the global git hooks
 ok() { if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "PASS $1"; else fail=$((fail+1)); echo "FAIL $1: expected [$3], got [$2]"; fi; }
 PAD=$(printf ' %.0s' {1..150}); LOADER="var z = '-6752-3';"
 export REPOGUARD_GITHUB_API=http://127.0.0.1:$PORT REPOGUARD_GITHUB_TOKEN=test MOCK_PROTECTED=locked
@@ -52,7 +52,14 @@ ok "old infection still only reported" "$(git -C $B ls-tree -r --name-only old-i
 R=$(poll --fix)
 ok "our own fix commit doesn't trigger again" "$(j "len(d['new_findings']) + len(d['fixed'])" <<< "$R")" 0
 
-R=$(poll --fix --fix-existing)
+OLDHEAD=$(git -C $B rev-parse old-infected)
+P=$(/usr/bin/python3 -I "$RES/github_watch.py" preview --rules "$RES/rules.json" --state "$T/state.json")
+ok "preview changes nothing on GitHub" "$(git -C $B rev-parse old-infected)" "$OLDHEAD"
+ok "preview lists both reported branches" "$(j "[b['branch'] for b in d['branches']]" <<< "$P")" "['locked', 'old-infected']"
+ok "preview shows init will be deleted" "$(j "[(i['path'], i['action']) for b in d['branches'] if b['branch']=='old-infected' for i in b['items']]" <<< "$P")" "[('init', 'delete')]"
+j "[b['id'] for b in d['branches'] if b['branch']=='old-infected']" <<< "$P" | /usr/bin/python3 -I -c "import ast,json,sys;print(json.dumps(ast.literal_eval(sys.stdin.read())))" > "$T/approved.json"
+R=$(poll --fix-existing --approved "$T/approved.json")
+ok "only the approved branch is touched" "$(j "len(d['manual'])" <<< "$R")" 0
 ok "Fix all on GitHub fixes the old infection" "$(git -C $B ls-tree -r --name-only old-infected | grep -c '^init$')" 0
 ok "only the protected branch is left" "$(j "[f['branch'] for f in d['findings']]" <<< "$R")" "['locked']"
 ok "log records the fix" "$(grep -c 'GITHUB FIXED acme/app main' $T/log)" 1

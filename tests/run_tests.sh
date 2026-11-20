@@ -1,8 +1,8 @@
 #!/bin/zsh
 # End-to-end tests using fake repos with harmless copies of the malware's patterns.
 # Usage: tests/run_tests.sh SCRATCH_DIR
-ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgtest; mkdir -p "$T"
-export SCAN_NO_NOTIFY=1
+ROOT=${0:A:h:h}; T=${1:?scratch dir required}/rgtest; rm -rf "$T"; mkdir -p "$T"
+export SCAN_NO_NOTIFY=1 REPOGUARD_ALLOW_FETCH=1  # the fake infected repos below must not trip the global git hooks
 RES="$ROOT/Resources"; W="$T/watch"; mkdir -p "$W"; ST="$T/state.json"; LOG="$T/log"; pass=0; fail=0
 D="/Applications/GitHub Desktop.app/Contents/Resources/app/git/bin/git"
 eng() { /usr/bin/python3 -I "$RES/engine.py" "$1" --watch "$W" --state "$ST" --rules "$RES/rules.json" --log "$LOG" "${@:2}"; }

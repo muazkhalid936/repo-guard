@@ -42,9 +42,10 @@ HOT = re.compile(r"(?:^|/)(?:\.gitignore|package\.json|init|conftest\.py|session
 # Only those exact files and only those rules are skipped. Hidden off-screen code and obfuscation
 # are still caught in them, and every other file in the repo (a planted utils/session.py, say)
 # is checked normally.
-SELF_REPO = re.compile(r"(?:^|/)repo-?guard$", re.I)
+SELF_REPO = re.compile(r"(?:^|/)repo-?guard(?:-windows)?$", re.I)
 SELF_FILES = re.compile(r"^(?:Resources/(?:engine|cleaner|server_agent|mac_agent|github_watch|storage)\.py"
-                        r"|Resources/rules\.json|tests/[^/]+\.(?:sh|py))$")
+                        r"|Resources/rules\.json|tests/[^/]+\.(?:sh|py)"
+                        r"|repoguard/core/(?:engine|cleaner|github_watch|pc_agent|gitscan)\.py|repoguard/core/rules\.json)$")
 SIGNATURE_RULES = {"known_code", "known_host", "loader_lines", "eth_loader", "autorun", "encoded_exec",
                    "npm_loader", "gitignore_marker"}
 
@@ -224,6 +225,28 @@ def fix_branch(gh, repo, branch, head, hits):
     return c["sha"], notes, manual
 
 
+def preview(gh, findings):
+    """Every change Fix All on GitHub would make, for the person to approve. Reads only."""
+    out = []
+    for key, f in sorted(findings.items()):
+        b = {"id": f"{key}|{f['sha']}", "repo": f["repo"], "branch": f["branch"], "items": [], "error": ""}
+        try:
+            _, commit, _ = gh.request("GET", f"/repos/{f['repo']}/git/commits/{f['sha']}")
+            _, tree, _ = gh.request("GET", f"/repos/{f['repo']}/git/trees/{commit['tree']['sha']}?recursive=1")
+            entries = {e["path"]: e for e in tree.get("tree", [])}
+            for path, h in sorted(f.get("hits", {}).items()):
+                e = entries.get(path)
+                if not e:
+                    continue
+                _, blob, _ = gh.request("GET", f"/repos/{f['repo']}/git/blobs/{e['sha']}")
+                data = base64.b64decode(blob["content"])
+                b["items"].append(cleaner.plan_item(f["repo"], path, data, [tuple(x) for x in h], f"GitHub branch {f['branch']}"))
+        except GitHubError as e:
+            b["error"] = explain(e)
+        out.append(b)
+    return out
+
+
 def explain(e):
     if isinstance(e, GitHubError):
         if e.status == 422 and "protected" in str(e).lower() or e.status == 403 and "protected" in str(e).lower():
@@ -239,12 +262,13 @@ def explain(e):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["poll"])
+    ap.add_argument("mode", choices=["poll", "preview"])
     ap.add_argument("--rules", required=True)
     ap.add_argument("--state", required=True)
     ap.add_argument("--log", default="")
     ap.add_argument("--fix", action="store_true", help="remove malware found in new pushes right away")
-    ap.add_argument("--fix-existing", action="store_true", help="also fix branches that were infected before the watch started")
+    ap.add_argument("--fix-existing", action="store_true", help="also fix branches already reported (Fix All on GitHub)")
+    ap.add_argument("--approved", default="", help="JSON file listing the branch ids the person approved in the preview")
     a = ap.parse_args()
 
     rules = engine.Rules(a.rules)
@@ -260,6 +284,12 @@ def main():
     repos_state = state.setdefault("repos", {})
     findings = state.setdefault("findings", {})  # "repo|branch" -> {...}
     gh = GitHub(gh_token())
+    if a.mode == "preview":
+        print(json.dumps({"branches": preview(gh, findings)}))
+        return
+    approved = None
+    if a.approved:
+        approved = set(json.load(open(a.approved)))
     scanner = Scanner(gh, rules, state)
     now = time.time()
     out = {"repos": 0, "changed": [], "new_findings": [], "fixed": [], "manual": [], "errors": []}
@@ -380,12 +410,15 @@ def main():
             if is_new and not existing:
                 out["new_findings"].append(f)
                 log_lines.append(f"{stamp} GITHUB THREAT {repo} {name}: {', '.join(sorted(hits))} ({'; '.join(labels)})")
-            if a.fix and (not existing or a.fix_existing):
+            if a.fix and not existing:  # auto-fix of brand-new pushes (off unless chosen in Settings)
                 do_fix(repo, name, head, hits, old)
 
-    if a.fix and a.fix_existing:
-        # branches infected before the watch started and unchanged since
+    if a.fix_existing:
+        # Fix All on GitHub: reported branches that haven't moved since. With --approved, only the exact
+        # branch versions the person saw in the preview; a branch pushed to since then is left alone.
         for key, f in list(findings.items()):
+            if approved is not None and f"{key}|{f['sha']}" not in approved:
+                continue
             if f["repo"] in repos_state and repos_state[f["repo"]]["branches"].get(f["branch"]) == f["sha"]:
                 do_fix(f["repo"], f["branch"], f["sha"], {p: [tuple(x) for x in h] for p, h in f.get("hits", {}).items()}, f["sha"])
 

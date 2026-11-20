@@ -41,7 +41,8 @@ final class GitHubWatcher: ObservableObject {
     @Published var enabled = UserDefaults.standard.object(forKey: "ghWatch") as? Bool ?? true {
         didSet { UserDefaults.standard.set(enabled, forKey: "ghWatch"); reschedule() }
     }
-    @Published var autoFix = UserDefaults.standard.object(forKey: "ghAutoFix") as? Bool ?? true {
+    // Off by default: fixes happen only after the person reviews them (Review & Fix on GitHub).
+    @Published var autoFix = UserDefaults.standard.object(forKey: "ghAutoFix") as? Bool ?? false {
         didSet { UserDefaults.standard.set(autoFix, forKey: "ghAutoFix") }
     }
     @Published var minutes = UserDefaults.standard.object(forKey: "ghMinutes") as? Int ?? 3 {
@@ -50,6 +51,9 @@ final class GitHubWatcher: ObservableObject {
     @Published var result: GHResult?
     @Published var running = false
     @Published var lastFixAll: GHResult?
+    @Published var plan: GHPlan?
+    @Published var previewing = false
+    @Published var previewError: String?
 
     var onNewThreats: (([GHFinding], [GHFix]) -> Void)?
     private var timer: Timer?
@@ -78,13 +82,36 @@ final class GitHubWatcher: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.poll() }
     }
 
-    func poll(fixExisting: Bool = false) {
-        guard enabled || fixExisting, !running else { return }
-        running = true
-        let fix = autoFix || fixExisting
+    /// Works out what Fix All on GitHub would change. Reads from GitHub only.
+    func preview() {
+        guard !previewing, !running else { return }
+        previewing = true
+        previewError = nil
         queue.async { [weak self] in
             guard let self = self else { return }
-            let r = self.execute(fix: fix, fixExisting: fixExisting)
+            var plan: GHPlan?
+            var err = "RepoGuard is missing its GitHub files. Reinstall it."
+            if let script = Bundle.main.path(forResource: "github_watch", ofType: "py"),
+               let rules = Bundle.main.path(forResource: "rules", ofType: "json") {
+                let r = runProcess("/usr/bin/python3", ["-I", script, "preview", "--rules", rules, "--state", "\(supportDir)/github-watch.json"], timeout: 600)
+                plan = try? JSONDecoder().decode(GHPlan.self, from: r.out)
+                err = "Couldn't read the branches from GitHub: \(r.errText.trimmingCharacters(in: .whitespacesAndNewlines).suffix(200))"
+            }
+            DispatchQueue.main.async {
+                self.previewing = false
+                if let p = plan { self.plan = p } else { self.previewError = err }
+            }
+        }
+    }
+
+    /// `approved`: branch ids from the review sheet. Fix All only touches those exact branch versions.
+    func poll(fixExisting: Bool = false, approved: [String]? = nil) {
+        guard enabled || fixExisting, !running else { return }
+        running = true
+        let fix = autoFix
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let r = self.execute(fix: fix, fixExisting: fixExisting, approved: approved)
             DispatchQueue.main.async {
                 self.running = false
                 self.result = r
@@ -94,7 +121,7 @@ final class GitHubWatcher: ObservableObject {
         }
     }
 
-    private func execute(fix: Bool, fixExisting: Bool) -> GHResult {
+    private func execute(fix: Bool, fixExisting: Bool, approved: [String]?) -> GHResult {
         guard let script = Bundle.main.path(forResource: "github_watch", ofType: "py"),
               let rules = Bundle.main.path(forResource: "rules", ofType: "json") else {
             return GHResult(error: "RepoGuard is missing its GitHub files. Reinstall it.")
@@ -102,6 +129,13 @@ final class GitHubWatcher: ObservableObject {
         var args = ["-I", script, "poll", "--rules", rules, "--state", "\(supportDir)/github-watch.json", "--log", logFile]
         if fix { args.append("--fix") }
         if fixExisting { args.append("--fix-existing") }
+        if let ids = approved {
+            let file = "\(supportDir)/github-approved.json"
+            guard let d = try? JSONEncoder().encode(ids), FileManager.default.createFile(atPath: file, contents: d) else {
+                return GHResult(error: "Couldn't save your approval. Nothing was changed.")
+            }
+            args += ["--approved", file]
+        }
         let r = runProcess("/usr/bin/python3", args, timeout: 1500)
         let text = String(data: r.out, encoding: .utf8) ?? ""
         if let line = text.split(separator: "\n").last(where: { $0.hasPrefix("{") }),
@@ -168,7 +202,6 @@ struct GitHubSettingsCard: View {
 
 struct GitHubThreatsSection: View {
     @ObservedObject var gh = GitHubWatcher.shared
-    @State private var confirm = false
     @State private var open = true
 
     var body: some View {
@@ -185,10 +218,11 @@ struct GitHubThreatsSection: View {
                 }.buttonStyle(.plain)
                 .overlay(alignment: .trailing) {
                     if !gh.findings.isEmpty {
-                        Button(gh.running ? "Fixing…" : "Fix All on GitHub…") { confirm = true }
-                            .buttonStyle(.borderedProminent).tint(dangerRed).disabled(gh.running)
+                        Button(gh.running ? "Fixing…" : gh.previewing ? "Preparing review…" : "Review & Fix on GitHub…") { gh.preview() }
+                            .buttonStyle(.borderedProminent).tint(dangerRed).disabled(gh.running || gh.previewing)
                     }
                 }
+                if let e = gh.previewError { Text(e).font(.callout).foregroundColor(cautionOrange) }
                 if let r = gh.lastFixAll {
                     Card {
                         VStack(alignment: .leading, spacing: 4) {
@@ -218,12 +252,7 @@ struct GitHubThreatsSection: View {
                     }
                 }
             }
-            .alert("Fix \(gh.findings.count) branches on GitHub?", isPresented: $confirm) {
-                Button("Fix on GitHub", role: .destructive) { gh.poll(fixExisting: true) }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Each infected branch gets one \"Remove malware (RepoGuard)\" commit on top, pushed as a normal push without force. Teammates will see that commit. Protected branches are skipped and listed.")
-            }
+            .sheet(item: $gh.plan) { GHPreviewSheet(plan: $0) }
         }
     }
 }

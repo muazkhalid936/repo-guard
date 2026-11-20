@@ -260,6 +260,45 @@ func writeSnapshots(to dir: String) {
     render("4-repositories", sampleModel(threats: true), .repositories)
     render("5-activity", sampleModel(threats: true), .activity)
     render("6-settings", sampleModel(threats: false), .settings)
+    if let f = env["REPOGUARD_SAMPLE_PLAN"], let d = FileManager.default.contents(atPath: f),
+       let plan = try? JSONDecoder().decode(CleanPlan.self, from: d) {
+        for dark in [false, true] {
+            let host = NSHostingView(rootView: CleanPreviewSheet(plan: plan, model: sampleModel(threats: true), openFirst: true).frame(width: 820, height: 760))
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 760), styleMask: [.titled], backing: .buffered, defer: false)
+            w.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+            w.contentView = host
+            w.layoutIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.cacheDisplay(in: host.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/7-review\(dark ? "-dark" : "").png"))
+            }
+        }
+    }
+    do {
+        let s = StorageStore.shared
+        let L = "\(home)/Library/Developer"
+        func it(_ id: String, _ cat: String, _ title: String, _ path: String, _ size: Int64, _ detail: String, _ kind: String) -> CleanItem {
+            CleanItem(id: id, category: cat, title: title, path: path, size: size, detail: detail, selected: true, kind: kind)
+        }
+        let items = [it("xcode-derived", "Xcode", "Xcode DerivedData", "\(L)/Xcode/DerivedData", 18_400_000_000, "Build products and indexes. Xcode rebuilds them.", "contents"),
+                     it("xcode-sim-caches", "Xcode", "Simulator caches", "\(L)/CoreSimulator/Caches", 2_100_000_000, "Rebuilt automatically.", "contents"),
+                     it("s1", "Simulators", "iPhone 16 Pro (iOS 18.2)", "\(L)/CoreSimulator/Devices/5A1C0F2E-1111-4E44-9D4B-0E1B2C3D4E5F", 6_300_000_000, "Apps and data inside this simulator. Deleting removes them for good.", "simulator"),
+                     it("s2", "Simulators", "iPad Air (iOS 17.5) (unavailable)", "\(L)/CoreSimulator/Devices/7B2D1A3F-2222-4F55-8E6C-1F2C3D4E5F60", 3_900_000_000, "Xcode doesn't have this simulator's iOS version right now (it can come back after Xcode downloads it). Deleting removes its apps and data.", "simulator"),
+                     it("npm", "Package caches", "npm cache", "\(home)/.npm/_cacache", 4_200_000_000, "Downloaded packages. npm downloads them again when needed.", "contents")]
+        s.result = StorageResult(items: items, projects: [], disk: DiskInfo(total: 494_000_000_000, free: 41_000_000_000), stale_days: 30, time: "")
+        s.selected = Set(items.map(\.id))
+        for dark in [false, true] {
+            let host = NSHostingView(rootView: CleanReviewSheet(store: s))
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 720), styleMask: [.titled], backing: .buffered, defer: false)
+            w.appearance = NSAppearance(named: dark ? .darkAqua : .aqua); w.contentView = host; w.layoutIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.cacheDisplay(in: host.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/15-clean-review\(dark ? "-dark" : "").png"))
+            }
+        }
+    }
     for (n, auth) in [("13-editor-ec2", AuthKind.ec2Connect), ("14-editor-password", AuthKind.password)] {
         var srv = Server(); srv.name = "Example - EC2"; srv.host = "203.0.113.10"; srv.user = "ubuntu"; srv.auth = auth
         srv.awsProfile = "default"; srv.awsRegion = "eu-north-1"; srv.instanceId = "i-0123456789abcdef0"
